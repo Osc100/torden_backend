@@ -1,0 +1,24 @@
+[package]
+name = "automata_backend"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "^1.28", features = ["macros", "rt-multi-thread"] }
+axum = { version = "^0.6", features = ["ws", "headers", "tracing"] }
+sqlx = { version = "^0.6", features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "macros",
+  "time",
+  "uuid",
+] }
+futures = "0.3"
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+dotenv = "0.15.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
