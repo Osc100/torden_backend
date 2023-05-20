@@ -7,7 +7,7 @@ CREATE TYPE account_role AS ENUM ('agent', 'manager', 'superuser');
 
 CREATE TABLE account (
     id serial PRIMARY KEY,
-    email varchar(255) NOT NULL,
+    email varchar(255) NOT NULL UNIQUE,
     password varchar(255) NOT NULL, -- hashed
     --
     first_name varchar(255) NOT NULL,
