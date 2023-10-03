@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use sqlx::FromRow;
+
 #[derive(Serialize, Deserialize)]
 pub struct ChatCompletion {
     // pub id: String,
@@ -49,4 +51,54 @@ pub struct GPTRequest {
 #[derive(Deserialize)]
 pub struct SocketConnectionParams {
     pub client_name: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub enum FirstMessageType {
+    NewUUID,
+    ExistingUUID,
+    ChatAgent,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct FirstMessage {
+    pub message_type: FirstMessageType,
+    pub message_content: String,
+}
+
+#[derive(Serialize, Deserialize, FromRow)]
+pub struct Account {
+    pub id: i32,
+    pub email: String,
+    pub password: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub role: AccountRole,
+    pub company_id: i32,
+    pub created: chrono::NaiveDateTime,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PublicAccountData {
+    // to user only lmao
+    pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub role: AccountRole,
+    pub company_id: i32,
+    pub created: chrono::NaiveDateTime,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AccountResponse {
+    account: PublicAccountData,
+    token: String,
+}
+
+#[derive(sqlx::Type, Debug, Serialize, Deserialize, Clone, Copy)]
+#[sqlx(type_name = "account_role", rename_all = "lowercase")]
+pub enum AccountRole {
+    Agent = 0,
+    Manager = 1,
+    Superuser = 2,
 }

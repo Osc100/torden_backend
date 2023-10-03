@@ -1,8 +1,9 @@
+pub mod api;
 pub mod structs;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        ConnectInfo, Query, State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
     },
     response::Response,
     routing::get,
@@ -11,16 +12,19 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use sqlx::{postgres::PgPoolOptions, types::Uuid, Pool, Postgres};
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, vec};
+use std::{collections::HashMap, net::SocketAddr, ops::ControlFlow, str::FromStr, sync::Arc, vec};
 use structs::{ChatCompletion, GPTMessage, GPTRequest, MessageRole};
 use tokio::sync::{broadcast, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::structs::{FirstMessage, FirstMessageType};
 struct AppState {
     channels: Mutex<HashMap<Uuid, ChannelState>>,
 }
 
 struct ChannelState {
     messages: Vec<GPTMessage>,
+    stopped_ai: bool,
     transmitter: broadcast::Sender<GPTMessage>,
 }
 
@@ -37,6 +41,7 @@ impl ChannelState {
 
         Self {
             messages,
+            stopped_ai: false,
             transmitter: broadcast::channel(2).0,
         }
     }
@@ -127,70 +132,26 @@ async fn handle_socket(
     let (mut sender, mut receiver) = stream.split();
     let mut transmitter = None::<broadcast::Sender<GPTMessage>>;
     let mut channel = Uuid::nil();
-    let mut messages: Vec<GPTMessage>;
 
     tracing::debug!("{} connected", who);
 
-    while let Some(Ok(first_message)) = receiver.next().await {
-        if let Message::Text(first_message_string) = first_message {
-            println!("{} first_message ", first_message_string.clone());
-
-            println!(
-                "{} first_message ",
-                first_message_string.clone() == "new_uuid"
-            );
-            if first_message_string.clone() == "new_uuid" {
-                let Ok(result) =
-                    sqlx::query!("INSERT INTO chat (company_id) VALUES ($1) RETURNING id", 1)
-                        .fetch_one(&pool)
-                        .await else {
-                            sender.send(Message::Text("Error creating new UUID on database level.".to_string())).await.unwrap();
-                            return;
-                        };
-
-                tracing::debug!("{} created new UUID {}", who, result.id);
-                channel = result.id;
-            } else {
-                print!("{} first_message ", first_message_string);
-                let Ok(existing_uuid) = Uuid::from_str(&first_message_string) else {
-                    sender.send(Message::Text("Invalid UUID".to_string())).await.unwrap();
-                    return;
-                };
-
-                let Ok(query_result ) = sqlx::query!("SELECT id FROM chat WHERE id = $1", existing_uuid)
-                    .fetch_one(&pool)
-                    .await else {
-                        sender.send(Message::Text("The UUID doesn't exist in the database".to_string())).await.unwrap();
-                        return;
-                    };
-
-                channel = query_result.id;
-            }
-
-            {
-                let mut channels = state.channels.lock().await;
-
-                let channel_state = channels
-                    .entry(channel.clone())
-                    .or_insert(ChannelState::from_db(pool.clone(), channel.clone()).await);
-
-                transmitter = Some(channel_state.transmitter.clone());
-                messages = channel_state.messages.clone();
-            }
-
-            break;
-            // Send all existing messages to the client.
-            // sender
-            //     .send(Message::Text(serde_json::to_string(&messages).unwrap()))
-            //     .await
-            //     .unwrap();
-            // break;
-        }
+    // Manage what to do on the first message
+    if let ControlFlow::Break(_) = handle_first_message(
+        &mut receiver,
+        &mut sender,
+        &pool,
+        who,
+        &mut channel,
+        &state,
+        &mut transmitter,
+    )
+    .await
+    {
+        return;
     }
 
     let transmitter = transmitter.unwrap();
     let mut rx = transmitter.subscribe();
-
     // Send messages from other clients to this client.
     let mut send_task = {
         tokio::spawn(async move {
@@ -251,15 +212,107 @@ async fn handle_socket(
     };
 }
 
+async fn handle_first_message(
+    receiver: &mut futures::stream::SplitStream<WebSocket>,
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    pool: &Pool<Postgres>,
+    who: SocketAddr,
+    channel: &mut Uuid,
+    state: &Arc<AppState>,
+    transmitter: &mut Option<broadcast::Sender<GPTMessage>>,
+) -> ControlFlow<()> {
+    while let Some(Ok(first_message)) = receiver.next().await {
+        if let Message::Text(first_message_string) = first_message {
+            println!("{} first_message ", first_message_string.clone());
+
+            let Ok(parsed_message) = serde_json::from_str::<FirstMessage>(&first_message_string)
+            else {
+                sender
+                    .send(Message::Text("Invalid first message".to_string()))
+                    .await
+                    .unwrap();
+                return ControlFlow::Break(());
+            };
+
+            match parsed_message.message_type {
+                FirstMessageType::NewUUID => {
+                    let Ok(result) =
+                        sqlx::query!("INSERT INTO chat (company_id) VALUES ($1) RETURNING id", 1)
+                            .fetch_one(pool)
+                            .await
+                    else {
+                        sender
+                            .send(Message::Text(
+                                "Error creating new UUID on database level.".to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        return ControlFlow::Break(());
+                    };
+
+                    tracing::debug!("{} created new UUID {}", who, result.id);
+                    *channel = result.id;
+                }
+                FirstMessageType::ExistingUUID => {
+                    let Ok(existing_uuid) = Uuid::from_str(&parsed_message.message_content) else {
+                        sender
+                            .send(Message::Text("Invalid UUID".to_string()))
+                            .await
+                            .unwrap();
+                        return ControlFlow::Break(());
+                    };
+
+                    let Ok(query_result) =
+                        sqlx::query!("SELECT id FROM chat WHERE id = $1", existing_uuid)
+                            .fetch_one(pool)
+                            .await
+                    else {
+                        sender
+                            .send(Message::Text(
+                                "The UUID doesn't exist in the database".to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        return ControlFlow::Break(());
+                    };
+
+                    *channel = query_result.id;
+                }
+                FirstMessageType::ChatAgent => {
+                    println!("should manage chant agent")
+                }
+            }
+
+            {
+                let mut channels = state.channels.lock().await;
+
+                let channel_state = channels
+                    .entry(channel.clone())
+                    .or_insert(ChannelState::from_db(pool.clone(), channel.clone()).await);
+
+                *transmitter = Some(channel_state.transmitter.clone());
+                let messages = channel_state.messages.clone();
+                // Send all existing messages to the client.
+                sender
+                    .send(Message::Text(serde_json::to_string(&messages).unwrap()))
+                    .await
+                    .unwrap();
+            }
+
+            break;
+        }
+    }
+    ControlFlow::Continue(())
+}
+
 async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<ChatCompletion> {
     let client = Client::new();
 
     let mut all_messages = vec![GPTMessage {
         role: MessageRole::User,
         content: r#"
-        You're a helpful sales representative who works in torden, an startup dedicated to automate customer service using LLMs, that won't mention
-        that's you're an AI under any cirscunstance.
-        Have into consideration to not surpass the 100 token limit.
+        You're a helpful sales representative who works in torden, an startup dedicated to automate customer service using LLMs. 
+        Write short, helpful messages.
         Here's some more context that you will answer only if asked: 
         The founders/members are Oscar Marin as Tech Lead and Software Architect, Kelly as Marketing Specialist, Agner as Design Specialist and Katherine as relationship management and sales.
         The startup doesn't have a fisical location yet and will make it's official annoucement in the Hackathon Nicaragua 2023"#.to_string(),
