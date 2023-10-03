@@ -225,6 +225,8 @@ async fn handle_first_message(
         if let Message::Text(first_message_string) = first_message {
             println!("{} first_message ", first_message_string.clone());
 
+            // serde_json::from_str::<FirstMessage>(&first_message_string).unwrap();
+
             let Ok(parsed_message) = serde_json::from_str::<FirstMessage>(&first_message_string)
             else {
                 sender
@@ -309,10 +311,10 @@ async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<ChatCom
     let client = Client::new();
 
     let mut all_messages = vec![GPTMessage {
-        role: MessageRole::User,
+        role: MessageRole::System,
         content: r#"
         You're a helpful sales representative who works in torden, an startup dedicated to automate customer service using LLMs. 
-        Write short, helpful messages.
+        Write short, helpful messages only about torden and politely decline questions about anything else.
         Here's some more context that you will answer only if asked: 
         The founders/members are Oscar Marin as Tech Lead and Software Architect, Kelly as Marketing Specialist, Agner as Design Specialist and Katherine as relationship management and sales.
         The startup doesn't have a fisical location yet and will make it's official annoucement in the Hackathon Nicaragua 2023"#.to_string(),
