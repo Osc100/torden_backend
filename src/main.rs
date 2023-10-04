@@ -1,12 +1,13 @@
-pub mod api;
-pub mod structs;
+mod api;
+mod structs;
+mod utils;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         ConnectInfo, State, WebSocketUpgrade,
     },
     response::Response,
-    routing::get,
+    routing::{get, post},
     Extension, Json, Router,
 };
 use futures::{SinkExt, StreamExt};
@@ -98,6 +99,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(ws_handler))
+        // .route("/login", post(api::login))
         .with_state(app_state)
         .layer(Extension(pool));
 
@@ -325,7 +327,7 @@ async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<ChatCom
     let request_data = GPTRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages: all_messages,
-        max_tokens: 100,
+        max_tokens: 250,
     };
 
     let response = client

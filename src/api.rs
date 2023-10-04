@@ -1,6 +1,8 @@
-use crate::structs::{Account, PublicAccountData};
+use crate::structs::{Account, AccountResponse, PublicAccountData, RegisterData};
+use crate::utils::register_user;
 use axum::http::StatusCode;
 use axum::{response::IntoResponse, Extension, Json};
+use jsonwebtoken::errors::Error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -36,29 +38,63 @@ pub async fn login(
         )
     };
 
-    return (StatusCode::OK, Json(json!(user)));
-}
+    let password_matches = bcrypt::verify(&payload.password, &user.password).unwrap();
 
-pub async fn register(
-    Json(payload): Json<Account>,
-    Extension(pool): Extension<sqlx::PgPool>,
-) -> impl IntoResponse {
-    let existing_user = sqlx::query!(r#"SELECT id FROM account WHERE email = $1"#, payload.email)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-
-    if existing_user.is_some() {
+    if !password_matches {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
             Json(json!({
-                "email": "Email already exists"
+                "non_field_error": "Invalid email or password"
             })),
         );
     }
 
-    let secret_key = get_secret_key();
-    let password_hash = bcrypt::hash(&payload.password, 12).unwrap();
+    let public_account_data = PublicAccountData::from(&user);
+    let token = generate_jwt(&public_account_data).unwrap();
 
-    return (StatusCode::OK, Json(json!({})));
+    return (
+        StatusCode::OK,
+        Json(json!(AccountResponse {
+            account: public_account_data,
+            token: token,
+        })),
+    );
+}
+
+pub async fn register_handler(
+    Json(payload): Json<RegisterData>,
+    Extension(pool): Extension<sqlx::PgPool>,
+) -> impl IntoResponse {
+    let registration_result = register_user(&payload, &pool).await;
+
+    let db_user = match registration_result {
+        Ok(user) => user,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "non_field_error": e
+                })),
+            )
+        }
+    };
+
+    let public_account_data = PublicAccountData::from(&db_user.into());
+    let token = generate_jwt(&public_account_data).unwrap();
+
+    return (
+        StatusCode::OK,
+        Json(json!(AccountResponse {
+            account: public_account_data,
+            token
+        })),
+    );
+}
+
+fn generate_jwt(user: &PublicAccountData) -> Result<String, Error> {
+    return jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        user,
+        &jsonwebtoken::EncodingKey::from_secret(get_secret_key().as_bytes()),
+    );
 }

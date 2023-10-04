@@ -66,7 +66,7 @@ pub struct FirstMessage {
     pub message_content: String,
 }
 
-#[derive(Serialize, Deserialize, FromRow)]
+#[derive(Serialize, Deserialize, FromRow, Debug)]
 pub struct Account {
     pub id: i32,
     pub email: String,
@@ -76,6 +76,17 @@ pub struct Account {
     pub role: AccountRole,
     pub company_id: i32,
     pub created: chrono::NaiveDateTime,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RegisterData {
+    // Only to be used in restricted registrations, because of the modifiable role.
+    pub email: String,
+    pub password: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub role: AccountRole,
+    pub company_id: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,10 +100,23 @@ pub struct PublicAccountData {
     pub created: chrono::NaiveDateTime,
 }
 
+impl From<&Account> for PublicAccountData {
+    fn from(account: &Account) -> Self {
+        PublicAccountData {
+            email: account.email.clone(),
+            first_name: account.first_name.clone(),
+            last_name: account.last_name.clone(),
+            role: account.role,
+            company_id: account.company_id,
+            created: account.created,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct AccountResponse {
-    account: PublicAccountData,
-    token: String,
+    pub account: PublicAccountData,
+    pub token: String,
 }
 
 #[derive(sqlx::Type, Debug, Serialize, Deserialize, Clone, Copy)]
