@@ -1,6 +1,8 @@
+use axum::Json;
+use reqwest::Client;
 use sqlx::PgPool;
 
-use crate::structs::{Account, RegisterData};
+use crate::structs::{Account, ChatCompletion, GPTMessage, GPTRequest, MessageRole, RegisterData};
 
 const HASH_SALT: u32 = 12;
 /// Tries to register to the DB, returns the user if successful.
@@ -25,4 +27,43 @@ pub async fn register_user(
     // uniqueness is enforced at the database level.
 
     return Ok(db_user);
+}
+
+pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<ChatCompletion> {
+    let client = Client::new();
+
+    let starter_message = GPTMessage {
+        role: MessageRole::System,
+        content: r#"
+        You're a helpful sales representative who works in torden, an startup dedicated to automate customer service using LLMs. 
+        Write short, helpful messages only about torden and politely decline questions about anything else.
+        Here's some more context that you will answer only if asked: 
+        The founders/members are Oscar Marin as Tech Lead and Software Architect, Kelly as Marketing Specialist, Agner as Design Specialist and Katherine as relationship management and sales.
+        The startup doesn't have a fisical location yet and will make it's official annoucement in the Hackathon Nicaragua 2023"#.to_string(),
+    };
+
+    let request_messages = if conversation_messages
+        .first()
+        .is_some_and(|x| x.role == MessageRole::System)
+    {
+        conversation_messages
+    } else {
+        vec![vec![starter_message], conversation_messages].concat()
+    };
+
+    let request_data = GPTRequest {
+        model: "gpt-3.5-turbo".to_string(),
+        messages: request_messages,
+        max_tokens: 250,
+    };
+
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(&std::env::var("OPENAI_API_KEY").unwrap())
+        .json(&request_data)
+        .send()
+        .await
+        .unwrap();
+
+    Json(response.json::<ChatCompletion>().await.unwrap())
 }

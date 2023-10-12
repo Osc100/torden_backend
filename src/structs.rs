@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use sqlx::FromRow;
+use sqlx::{types::Uuid, Pool, Postgres};
+use std::collections::HashMap;
+use tokio::sync::{broadcast, Mutex};
 
 #[derive(Serialize, Deserialize)]
 pub struct ChatCompletion {
@@ -26,7 +29,7 @@ pub struct Choice {
     pub index: u8,
 }
 
-#[derive(sqlx::Type, Serialize, Deserialize, Clone, Copy)]
+#[derive(sqlx::Type, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[sqlx(type_name = "message_role", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -53,7 +56,7 @@ pub struct SocketConnectionParams {
     pub client_name: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, PartialEq)]
 pub enum FirstMessageType {
     NewUUID,
     ExistingUUID,
@@ -119,10 +122,53 @@ pub struct AccountResponse {
     pub token: String,
 }
 
-#[derive(sqlx::Type, Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(sqlx::Type, Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[sqlx(type_name = "account_role", rename_all = "lowercase")]
 pub enum AccountRole {
     Agent = 0,
     Manager = 1,
     Superuser = 2,
+}
+
+pub struct AppState {
+    pub channels: Mutex<HashMap<Uuid, ChannelState>>,
+}
+
+pub struct ChannelState {
+    pub messages: Vec<GPTMessage>,
+    pub stopped_ai: bool,
+    pub transmitter: broadcast::Sender<GPTMessage>,
+}
+
+impl ChannelState {
+    pub async fn from_db(pool: Pool<Postgres>, uuid: Uuid) -> Self {
+        let messages = sqlx::query_as!(
+            GPTMessage,
+            r#"SELECT role as "role: MessageRole", text as content FROM message WHERE chat_id = $1"#,
+            uuid
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        Self {
+            messages,
+            stopped_ai: false,
+            transmitter: broadcast::channel(2).0,
+        }
+    }
+
+    pub async fn save_message(&mut self, message: GPTMessage, uuid: Uuid, pool: &Pool<Postgres>) {
+        sqlx::query!(
+            "INSERT INTO message (chat_id, role, text) VALUES ($1, $2, $3)",
+            uuid,
+            message.role as MessageRole,
+            message.content
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        self.messages.push(message);
+    }
 }
