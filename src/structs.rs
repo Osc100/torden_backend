@@ -102,6 +102,7 @@ pub struct PublicAccountData {
     pub role: AccountRole,
     pub company_id: i32,
     pub created: chrono::NaiveDateTime,
+    pub exp: usize,
 }
 
 impl From<&Account> for PublicAccountData {
@@ -113,6 +114,7 @@ impl From<&Account> for PublicAccountData {
             role: account.role,
             company_id: account.company_id,
             created: account.created,
+            exp: 1000000000000000,
         }
     }
 }

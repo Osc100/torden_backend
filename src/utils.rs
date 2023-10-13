@@ -4,7 +4,8 @@ use reqwest::Client;
 use sqlx::PgPool;
 
 use crate::structs::{
-    Account, ChatCompletion, GPTMessage, GPTRequest, MessageRole, PublicAccountData, RegisterData,
+    Account, AccountResponse, ChatCompletion, GPTMessage, GPTRequest, MessageRole,
+    PublicAccountData, RegisterData,
 };
 
 const HASH_SALT: u32 = 12;

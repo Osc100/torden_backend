@@ -206,6 +206,13 @@ pub async fn handle_first_message(
                     channel = query_result.id;
                 }
                 FirstMessageType::ChatAgent => {
+                    match decode_jwt(&parsed_message.message_content) {
+                        Ok(account) => {}
+                        Err(err) => {
+                            println!("{}", err);
+                        }
+                    }
+
                     let Ok(token_data) = decode_jwt(&parsed_message.message_content) else {
                         sender
                             .send(Message::Text("Invalid token".to_string()))
