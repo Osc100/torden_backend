@@ -1,8 +1,11 @@
 use axum::Json;
+use jsonwebtoken::{errors::Error, TokenData};
 use reqwest::Client;
 use sqlx::PgPool;
 
-use crate::structs::{Account, ChatCompletion, GPTMessage, GPTRequest, MessageRole, RegisterData};
+use crate::structs::{
+    Account, ChatCompletion, GPTMessage, GPTRequest, MessageRole, PublicAccountData, RegisterData,
+};
 
 const HASH_SALT: u32 = 12;
 /// Tries to register to the DB, returns the user if successful.
@@ -66,4 +69,28 @@ pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<Cha
         .unwrap();
 
     Json(response.json::<ChatCompletion>().await.unwrap())
+}
+
+pub fn generate_jwt(user: &PublicAccountData) -> Result<String, Error> {
+    return jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        user,
+        &jsonwebtoken::EncodingKey::from_secret(get_secret_key().as_bytes()),
+    );
+}
+
+pub fn decode_jwt(token: &str) -> Result<TokenData<PublicAccountData>, Error> {
+    return jsonwebtoken::decode::<PublicAccountData>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(get_secret_key().as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    );
+}
+
+pub fn get_secret_key() -> String {
+    std::env::var("SECRET_KEY").unwrap_or(
+        "wvdcrRaOonp0j3YBUErNsbL7iKCNKmHsogHj1wH0gyk4e1VSosoLFr3eLgXCCjhs
+NppDoepf5Y0l7mDuTUp0dw=="
+            .to_string(),
+    )
 }

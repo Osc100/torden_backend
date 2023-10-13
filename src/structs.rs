@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::{types::Uuid, Pool, Postgres};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
 #[derive(Serialize, Deserialize)]
@@ -92,7 +93,7 @@ pub struct RegisterData {
     pub company_id: i32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PublicAccountData {
     // to user only lmao
     pub email: String,
@@ -123,6 +124,7 @@ pub struct AccountResponse {
 }
 
 #[derive(sqlx::Type, Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "account_role", rename_all = "lowercase")]
 pub enum AccountRole {
     Agent = 0,
@@ -131,9 +133,12 @@ pub enum AccountRole {
 }
 
 pub struct AppState {
-    pub channels: Mutex<HashMap<Uuid, ChannelState>>,
+    pub channels: Arc<Mutex<HashMap<Uuid, ChannelState>>>,
+    /// Company ID -> Vec<PublicAccountData>
+    pub agent_pool: Arc<Mutex<HashMap<i32, Vec<PublicAccountData>>>>,
 }
 
+#[derive(Clone)]
 pub struct ChannelState {
     pub messages: Vec<GPTMessage>,
     pub stopped_ai: bool,

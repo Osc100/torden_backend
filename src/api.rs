@@ -1,18 +1,9 @@
 use crate::structs::{Account, AccountResponse, PublicAccountData, RegisterData};
-use crate::utils::register_user;
+use crate::utils::{generate_jwt, register_user};
 use axum::http::StatusCode;
 use axum::{response::IntoResponse, Extension, Json};
-use jsonwebtoken::errors::Error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-
-fn get_secret_key() -> String {
-    std::env::var("SECRET_KEY").unwrap_or(
-        "wvdcrRaOonp0j3YBUErNsbL7iKCNKmHsogHj1wH0gyk4e1VSosoLFr3eLgXCCjhs
-NppDoepf5Y0l7mDuTUp0dw=="
-            .to_string(),
-    )
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LoginRequest {
@@ -20,9 +11,9 @@ pub struct LoginRequest {
     password: String,
 }
 
-pub async fn login(
-    Json(payload): Json<LoginRequest>,
+pub async fn login_handler(
     Extension(pool): Extension<sqlx::PgPool>,
+    Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let Ok(user) = sqlx::query_as!(
         Account,
@@ -62,8 +53,8 @@ pub async fn login(
 }
 
 pub async fn register_handler(
-    Json(payload): Json<RegisterData>,
     Extension(pool): Extension<sqlx::PgPool>,
+    Json(payload): Json<RegisterData>,
 ) -> impl IntoResponse {
     let registration_result = register_user(&payload, &pool).await;
 
@@ -88,13 +79,5 @@ pub async fn register_handler(
             account: public_account_data,
             token
         })),
-    );
-}
-
-fn generate_jwt(user: &PublicAccountData) -> Result<String, Error> {
-    return jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        user,
-        &jsonwebtoken::EncodingKey::from_secret(get_secret_key().as_bytes()),
     );
 }
