@@ -42,7 +42,7 @@ pub async fn handle_socket(
 
     // Manage what to do on the first message
     let first_message_status =
-        handle_first_message(&mut receiver, &mut sender, &pool, who, &state).await;
+        handle_first_message(&mut receiver, &mut sender, &pool, &state).await;
 
     match first_message_status {
         FirstMessageResult::Break => return,
@@ -143,7 +143,6 @@ pub async fn handle_first_message(
     receiver: &mut futures::stream::SplitStream<WebSocket>,
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     pool: &Pool<Postgres>,
-    who: SocketAddr,
     state: &Arc<AppState>,
 ) -> FirstMessageResult {
     let channel: Uuid;
@@ -179,7 +178,6 @@ pub async fn handle_first_message(
                         return FirstMessageResult::Break;
                     };
 
-                    tracing::debug!("{} created new UUID {}", who, result.id);
                     channel = result.id;
                 }
                 FirstMessageType::ExistingUUID => {
