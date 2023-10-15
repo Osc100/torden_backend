@@ -20,8 +20,7 @@ pub async fn login_handler(
         r#"SELECT id, email, first_name, last_name, password, role as "role: _", company_id, created FROM account WHERE email = $1"#,
         payload.email
     )
-    .fetch_one(&pool).await else {
-        return (
+    .fetch_one(&pool).await else { return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "non_field_error": "Invalid email or password"
@@ -81,3 +80,4 @@ pub async fn register_handler(
         })),
     );
 }
+

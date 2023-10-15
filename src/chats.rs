@@ -1,5 +1,5 @@
 use crate::{
-    structs::{AppState, ChannelState, GPTMessage, MessageRole},
+    structs::{AppState, ChannelState, GPTMessage, MessageRole, WSMessage},
     utils::{decode_jwt, query_to_openai},
 };
 use axum::{
@@ -11,6 +11,7 @@ use axum::{
     Extension,
 };
 use futures::{SinkExt, StreamExt};
+use serde_json::json;
 use sqlx::{types::Uuid, Pool, Postgres};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
@@ -36,9 +37,10 @@ pub async fn handle_socket(
     pool: Pool<Postgres>,
 ) -> () {
     let (mut sender, mut receiver) = stream.split();
-    let mut transmitters: Vec<(Uuid, broadcast::Sender<GPTMessage>)> = vec![];
+    let mut transmitters: Vec<(Uuid, broadcast::Sender<WSMessage>)> = vec![];
 
     tracing::debug!("{} connected", who);
+    let role: MessageRole;
 
     // Manage what to do on the first message
     let first_message_status =
@@ -47,31 +49,39 @@ pub async fn handle_socket(
     match first_message_status {
         FirstMessageResult::Break => return,
         FirstMessageResult::ContinueSingleChannel(result) => {
+            role = MessageRole::User;
             transmitters.push(result);
         }
         FirstMessageResult::ContinueMultipleChannels(channels) => {
+            role = MessageRole::Agent;
             transmitters = channels;
         }
     }
 
-    let sender_arc = Arc::new(Mutex::new(sender));
-    let receiver_arc = Arc::new(Mutex::new(receiver));
+    let mut send_task_vec = vec![];
 
-    for (channel, transmitter) in transmitters {
-        let mut rx = transmitter.subscribe();
-        // Send messages from other clients to this client.
-        let state = state.clone();
-        let pool = pool.clone();
-        let sender_cloned_arc = sender_arc.clone();
-        let receiver_cloned_arc = receiver_arc.clone();
+    {
+        let transmitters = transmitters.clone();
+        let sender_arc = Arc::new(Mutex::new(sender));
 
-        let mut send_task = {
-            tokio::spawn({
+        // let state = state.clone();
+        // let pool = pool.clone();
+
+        for (channel, transmitter) in transmitters {
+            let sender_clone = sender_arc.clone();
+
+            let task = tokio::spawn({
                 async move {
-                    while let Ok(msg) = rx.recv().await {
-                        // In any websocket error, break loop.
+                    let mut rx = transmitter.subscribe();
+                    // Send messages from other clients to this client.
 
-                        if sender_cloned_arc
+                    while let Ok(msg) = rx.recv().await {
+                        if msg.channel != channel {
+                            continue;
+                        }
+
+                        // In any websocket error, break loop.
+                        if sender_clone
                             .lock()
                             .await
                             .send(Message::Text(serde_json::to_string(&msg).unwrap()))
@@ -82,63 +92,89 @@ pub async fn handle_socket(
                         }
                     }
                 }
-            })
-        };
+            });
 
-        // Receive messages from this client and send them to other clients.
-        // We need to access the `tx` variable directly again, so we can't shadow it here.
-        let mut recv_task = {
-            // Clone things we want to pass to the receiving task.
-            let tx = transmitter.clone();
+            send_task_vec.push(task);
+        }
+    };
 
-            // This task will receive messages from client and send them to broadcast subscribers.
-            tokio::spawn(async move {
-                let mut receiver = receiver_cloned_arc.lock().await;
+    // Receive messages from this client and send them to other clients.
+    // We need to access the `tx` variable directly again, so we can't shadow it here.
+    let mut recv_task = {
+        let transmitter_arc = Arc::new(transmitters);
+        // Clone things we want to pass to the receiving task.
+        // This task will receive messages from client and send them to broadcast subscribers.
+        tokio::spawn(async move {
+            while let Some(Ok(Message::Text(text))) = receiver.next().await {
+                let message_data = match serde_json::from_str::<WSMessage>(&text) {
+                    Ok(message_data) => message_data,
+                    Err(err) => {
+                        tracing::error!("Error parsing message: {}", err);
 
-                while let Some(Ok(Message::Text(text))) = receiver.next().await {
+                        continue;
+                    }
+                };
+
+                for (channel, transmitter) in transmitter_arc.iter() {
                     // This will broadcast to any customer service agent connected to the same channel.
+                    if message_data.channel != *channel {
+                        continue;
+                    }
 
-                    let _message = GPTMessage {
-                        role: MessageRole::User,
-                        content: text.clone(),
+                    let _message = WSMessage {
+                        channel: message_data.channel,
+                        message: GPTMessage {
+                            role,
+                            content: message_data.message.content.clone(),
+                        },
                     };
-                    let _ = tx.send(_message.clone());
+
+                    let _ = transmitter.send(_message.clone());
 
                     // Save message to database.
+
+                    // TODO: Investigate performance implications of querying while locking.
                     let mut channels = state.channels.lock().await;
                     let channel_state = channels.get_mut(&channel).unwrap();
 
-                    channel_state
-                        .save_message(_message, channel.clone(), &pool)
-                        .await;
+                    channel_state.save_message(_message.clone(), &pool).await;
 
-                    let openai_response = query_to_openai(channel_state.messages.clone()).await;
+                    if role != MessageRole::Assistant {
+                        let openai_response = query_to_openai(channel_state.messages.clone()).await;
 
-                    let ai_message = openai_response.choices[0].message.clone();
+                        let ai_message = openai_response.choices[0].message.clone();
 
-                    channel_state
-                        .save_message(ai_message.clone(), channel, &pool)
-                        .await;
+                        let channel_ai_message = WSMessage {
+                            channel: _message.channel,
+                            message: ai_message,
+                        };
+                        let _ = transmitter.send(channel_ai_message.clone());
 
-                    let _ = tx.send(ai_message);
+                        channel_state.save_message(channel_ai_message, &pool).await;
+                    }
                 }
-            })
-        };
+            }
+        })
+    };
 
-        // If either the sender or receiver task finishes, cancel the other one.
-        tokio::select! {
-            _ = (&mut send_task) => recv_task.abort(),
-            _ = (&mut recv_task) => send_task.abort(),
-        };
-    }
+    // If the sender task fails, then disconnect all clients.
+    tokio::select! {
+        _ = (&mut recv_task) =>
+            send_task_vec.iter_mut().for_each(|send_task| send_task.abort()),
+    };
 }
 
 pub enum FirstMessageResult {
-    ContinueSingleChannel((Uuid, broadcast::Sender<GPTMessage>)),
-    ContinueMultipleChannels(Vec<(Uuid, broadcast::Sender<GPTMessage>)>),
+    ContinueSingleChannel((Uuid, broadcast::Sender<WSMessage>)),
+    ContinueMultipleChannels(Vec<(Uuid, broadcast::Sender<WSMessage>)>),
     Break,
 }
 
+/// Decide what to do on the first message.
+/// Returns a tuple with the channel UUID and the transmitter.
+/// If the client is an agent, return all channels.
+/// If the client is a user, return the channel UUID and the transmitter.
+/// On any error it will send an error message to the client and return Break.
 pub async fn handle_first_message(
     receiver: &mut futures::stream::SplitStream<WebSocket>,
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
@@ -179,14 +215,24 @@ pub async fn handle_first_message(
                     };
 
                     channel = result.id;
+                    // Sends the UUID to the client.
+                    sender
+                        .send(Message::Text(
+                            json!({
+                                "channel": channel
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
                 }
                 FirstMessageType::ExistingUUID => {
-                    let Ok(existing_uuid) = Uuid::from_str(&parsed_message.message_content) else {
-                        sender
-                            .send(Message::Text("Invalid UUID".to_string()))
-                            .await
-                            .unwrap();
-                        return FirstMessageResult::Break;
+                    let existing_uuid = match Uuid::from_str(&parsed_message.message_content) {
+                        Ok(uuid) => uuid,
+                        Err(err) => {
+                            sender.send(Message::Text(err.to_string())).await.unwrap();
+                            return FirstMessageResult::Break;
+                        }
                     };
 
                     let Ok(query_result) =
@@ -206,13 +252,6 @@ pub async fn handle_first_message(
                     channel = query_result.id;
                 }
                 FirstMessageType::ChatAgent => {
-                    match decode_jwt(&parsed_message.message_content) {
-                        Ok(account) => {}
-                        Err(err) => {
-                            println!("{}", err);
-                        }
-                    }
-
                     let Ok(token_data) = decode_jwt(&parsed_message.message_content) else {
                         sender
                             .send(Message::Text("Invalid token".to_string()))

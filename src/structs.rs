@@ -37,12 +37,19 @@ pub enum MessageRole {
     User,
     System,
     Assistant,
+    Agent,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GPTMessage {
     pub role: MessageRole,
     pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WSMessage {
+    pub channel: Uuid,
+    pub message: GPTMessage,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,7 +64,7 @@ pub struct SocketConnectionParams {
     pub client_name: Option<String>,
 }
 
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Deserialize, Clone, PartialEq, Copy)]
 pub enum FirstMessageType {
     NewUUID,
     ExistingUUID,
@@ -143,8 +150,9 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct ChannelState {
     pub messages: Vec<GPTMessage>,
+    pub current_agent: Option<PublicAccountData>,
     pub stopped_ai: bool,
-    pub transmitter: broadcast::Sender<GPTMessage>,
+    pub transmitter: broadcast::Sender<WSMessage>,
 }
 
 impl ChannelState {
@@ -160,22 +168,23 @@ impl ChannelState {
 
         Self {
             messages,
+            current_agent: None,
             stopped_ai: false,
             transmitter: broadcast::channel(2).0,
         }
     }
 
-    pub async fn save_message(&mut self, message: GPTMessage, uuid: Uuid, pool: &Pool<Postgres>) {
+    pub async fn save_message(&mut self, ws_message: WSMessage, pool: &Pool<Postgres>) {
         sqlx::query!(
             "INSERT INTO message (chat_id, role, text) VALUES ($1, $2, $3)",
-            uuid,
-            message.role as MessageRole,
-            message.content
+            ws_message.channel,
+            ws_message.message.role as MessageRole,
+            ws_message.message.content
         )
         .execute(pool)
         .await
         .unwrap();
 
-        self.messages.push(message);
+        self.messages.push(ws_message.message);
     }
 }
