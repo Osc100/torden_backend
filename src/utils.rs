@@ -4,10 +4,11 @@ use axum::Json;
 use jsonwebtoken::{errors::Error, TokenData};
 use reqwest::Client;
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 
 use crate::structs::{
     Account, AppState, ChatCompletion, Company, GPTMessage, GPTRequest, MessageRole,
-    PublicAccountData, RegisterData,
+    PublicAccountData, RegisterData, SingleAgentAction,
 };
 
 const HASH_SALT: u32 = 12;
@@ -102,7 +103,7 @@ NppDoepf5Y0l7mDuTUp0dw=="
 pub async fn get_chats_per_agent(
     app_state: Arc<AppState>,
     company_id: i32,
-) -> Vec<(PublicAccountData, usize)> {
+) -> Vec<(PublicAccountData, mpsc::Sender<SingleAgentAction>, usize)> {
     let channels = app_state.channels.lock().await;
     let agents = app_state.agent_pool.lock().await;
 
@@ -113,6 +114,7 @@ pub async fn get_chats_per_agent(
         .map(|agent| {
             (
                 agent.0.to_owned(),
+                agent.1.to_owned(),
                 channels
                     .iter()
                     .filter(|(_, channel)| {

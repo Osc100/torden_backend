@@ -8,9 +8,9 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
-use chats::AgentPoolAction;
 use sqlx::postgres::PgPoolOptions;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use structs::AgentPoolAction;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};

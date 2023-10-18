@@ -47,6 +47,7 @@ pub async fn handle_socket(
     let (mut sender, mut receiver) = stream.split();
     let mut transmitters: Vec<(Uuid, ChannelTransmitter)> = vec![];
     let mut agent_receiver: Option<mpsc::Receiver<SingleAgentAction>> = None;
+    let mut agent_data: Option<PublicAccountData> = None;
 
     tracing::debug!("{} connected", who);
     let role: MessageRole;
@@ -64,6 +65,7 @@ pub async fn handle_socket(
         FirstMessageResult::ContinueMultipleChannels(channels) => {
             role = MessageRole::Agent;
             transmitters = channels.channels;
+            agent_data = Some(channels.account);
             agent_receiver = Some(channels.agent_receiver);
         }
     }
@@ -140,29 +142,49 @@ pub async fn handle_socket(
         }
     });
 
+    let mut agent_rx_task: Option<JoinHandle<()>> = None;
+    let agent_extra_tasks = Arc::new(Mutex::new(vec![]));
+
     if let Some(mut agent_receiver) = agent_receiver {
-        // TODO: DROP TASK
-        let agent_rx_task = tokio::spawn(async move {
+        let agent_extra_tasks = agent_extra_tasks.clone();
+        let tmp_task = tokio::spawn(async move {
             while let Some(action) = agent_receiver.recv().await {
                 match action {
                     SingleAgentAction::AddChat((channel, transmitter)) => {
-                        // TODO: DROP TASK
                         let task = start_channel_listener(channel, transmitter, sender_arc.clone());
+                        agent_extra_tasks.lock().await.push(task);
                     }
                 }
             }
         });
+
+        agent_rx_task = Some(tmp_task);
     }
-    // If the sender task fails, then disconnect all clients.
+    // If the client disconnects, then...
+    // Cancel all tasks.
     tokio::select! {
         _ = (&mut recv_task) =>
-            send_task_vec.iter_mut().for_each(|send_task| send_task.abort()),
+            {
+            send_task_vec.iter_mut().for_each(|send_task| send_task.abort());
+            if let Some(agent_rx_task) = agent_rx_task {
+                agent_rx_task.abort();
+
+                if let Some(account) = agent_data {
+                    agent_tx.send(AgentPoolAction::RemoveAgent(account)).await.unwrap();
+                }
+
+            }
+            for task in agent_extra_tasks.lock().await.iter_mut() {
+                task.abort();
+            }
+        }
     };
 }
 
-struct MultipleChannelResult {
-    channels: Vec<(Uuid, ChannelTransmitter)>,
-    agent_receiver: mpsc::Receiver<SingleAgentAction>,
+pub struct MultipleChannelResult {
+    pub channels: Vec<(Uuid, ChannelTransmitter)>,
+    pub account: PublicAccountData,
+    pub agent_receiver: mpsc::Receiver<SingleAgentAction>,
 }
 pub enum FirstMessageResult {
     ContinueSingleChannel((Uuid, ChannelTransmitter)),
@@ -277,6 +299,7 @@ pub async fn handle_first_message(
                     // Get all channels for this company.
                     // TODO: FILTER BY COMPANY ID
                     return FirstMessageResult::ContinueMultipleChannels(MultipleChannelResult {
+                        account: token_data.claims.to_owned(),
                         channels: state
                             .channels
                             .lock()
@@ -382,16 +405,23 @@ pub fn agent_pool_task(
                         let mut chats_per_agent =
                             get_chats_per_agent(app_state.clone(), removed_agent.company_id).await;
 
-                        chats_per_agent.sort_unstable_by_key(|x| x.1);
+                        chats_per_agent.sort_unstable_by_key(|x| x.2);
 
                         let mut channels = app_state.channels.lock().await;
 
                         // Assign all chats from the removed agent to the agent with the least amount of chats.
-                        if let Some((agent, _)) = chats_per_agent.first() {
-                            for (_, channel_state) in channels.iter_mut() {
+                        if let Some((agent, agent_channel, _)) = chats_per_agent.first() {
+                            for (channel, channel_state) in channels.iter_mut() {
                                 if channel_state.current_agent.as_ref().is_some_and(
                                     |current_agent| current_agent.id == removed_agent.id,
                                 ) {
+                                    agent_channel
+                                        .send(SingleAgentAction::AddChat((
+                                            channel.to_owned(),
+                                            channel_state.transmitter.clone(),
+                                        )))
+                                        .await
+                                        .unwrap();
                                     channel_state.current_agent = Some(agent.to_owned());
                                 }
                             }
@@ -403,12 +433,19 @@ pub fn agent_pool_task(
                     let mut chats_per_agent =
                         get_chats_per_agent(app_state.clone(), company.0).await;
 
-                    chats_per_agent.sort_unstable_by_key(|x| x.1);
+                    chats_per_agent.sort_unstable_by_key(|x| x.2);
 
                     let mut channels = app_state.channels.lock().await;
 
-                    if let Some((agent, _)) = chats_per_agent.first() {
+                    if let Some((agent, agent_channel, _)) = chats_per_agent.first() {
                         let channel_state = channels.get_mut(&channel).unwrap();
+                        agent_channel
+                            .send(SingleAgentAction::AddChat((
+                                channel.to_owned(),
+                                channel_state.transmitter.clone(),
+                            )))
+                            .await
+                            .unwrap();
 
                         channel_state.current_agent = Some(agent.to_owned());
                     }
