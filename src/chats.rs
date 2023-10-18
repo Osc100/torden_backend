@@ -1,6 +1,9 @@
 use crate::{
-    structs::{AppState, ChannelState, GPTMessage, MessageRole, WSMessage},
-    utils::{decode_jwt, query_to_openai},
+    structs::{
+        AgentPoolAction, AppState, ChannelState, ChannelTransmitter, Company, GPTMessage,
+        MessageRole, PublicAccountData, SingleAgentAction, WSMessage,
+    },
+    utils::{decode_jwt, get_chats_per_agent, query_to_openai},
 };
 use axum::{
     extract::{
@@ -14,7 +17,10 @@ use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use sqlx::{types::Uuid, Pool, Postgres};
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+
+const AGENT_CHANNEL_BUFFER: u8 = 10;
 
 use crate::structs::{FirstMessage, FirstMessageType};
 pub async fn ws_handler(
@@ -22,12 +28,13 @@ pub async fn ws_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Extension(pool): Extension<Pool<Postgres>>,
+    Extension(agent_tx): Extension<mpsc::Sender<AgentPoolAction>>,
 ) -> Response {
     let addr_string = addr.ip().to_string();
     println!("{} ", addr_string);
     println!("at {addr} connected.");
 
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, state, pool))
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, state, pool, agent_tx))
 }
 
 pub async fn handle_socket(
@@ -35,16 +42,18 @@ pub async fn handle_socket(
     who: SocketAddr,
     state: Arc<AppState>,
     pool: Pool<Postgres>,
+    agent_tx: mpsc::Sender<AgentPoolAction>,
 ) -> () {
     let (mut sender, mut receiver) = stream.split();
-    let mut transmitters: Vec<(Uuid, broadcast::Sender<WSMessage>)> = vec![];
+    let mut transmitters: Vec<(Uuid, ChannelTransmitter)> = vec![];
+    let mut agent_receiver: Option<mpsc::Receiver<SingleAgentAction>> = None;
 
     tracing::debug!("{} connected", who);
     let role: MessageRole;
 
     // Manage what to do on the first message
     let first_message_status =
-        handle_first_message(&mut receiver, &mut sender, &pool, &state).await;
+        handle_first_message(&mut receiver, &mut sender, &pool, &state, &agent_tx).await;
 
     match first_message_status {
         FirstMessageResult::Break => return,
@@ -54,109 +63,96 @@ pub async fn handle_socket(
         }
         FirstMessageResult::ContinueMultipleChannels(channels) => {
             role = MessageRole::Agent;
-            transmitters = channels;
+            transmitters = channels.channels;
+            agent_receiver = Some(channels.agent_receiver);
         }
     }
 
+    let sender_arc = Arc::new(Mutex::new(sender));
     let mut send_task_vec = vec![];
 
     {
         let transmitters = transmitters.clone();
-        let sender_arc = Arc::new(Mutex::new(sender));
-
         // let state = state.clone();
         // let pool = pool.clone();
 
         for (channel, transmitter) in transmitters {
-            let sender_clone = sender_arc.clone();
-
-            let task = tokio::spawn({
-                async move {
-                    let mut rx = transmitter.subscribe();
-                    // Send messages from other clients to this client.
-
-                    while let Ok(msg) = rx.recv().await {
-                        if msg.channel != channel {
-                            continue;
-                        }
-
-                        // In any websocket error, break loop.
-                        if sender_clone
-                            .lock()
-                            .await
-                            .send(Message::Text(serde_json::to_string(&msg).unwrap()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            });
-
+            let task = start_channel_listener(channel, transmitter, sender_arc.clone());
             send_task_vec.push(task);
         }
     };
 
     // Receive messages from this client and send them to other clients.
     // We need to access the `tx` variable directly again, so we can't shadow it here.
-    let mut recv_task = {
-        let transmitter_arc = Arc::new(transmitters);
-        // Clone things we want to pass to the receiving task.
-        // This task will receive messages from client and send them to broadcast subscribers.
-        tokio::spawn(async move {
-            while let Some(Ok(Message::Text(text))) = receiver.next().await {
-                let message_data = match serde_json::from_str::<WSMessage>(&text) {
-                    Ok(message_data) => message_data,
-                    Err(err) => {
-                        tracing::error!("Error parsing message: {}", err);
+    // Clone things we want to pass to the receiving task.
+    let transmitter_arc = Arc::new(transmitters);
+    // Clone things we want to pass to the receiving task.
+    // This task will receive messages from client and send them to broadcast subscribers.
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+            let message_data = match serde_json::from_str::<WSMessage>(&text) {
+                Ok(message_data) => message_data,
+                Err(err) => {
+                    tracing::error!("Error parsing message: {}", err);
 
-                        continue;
-                    }
+                    continue;
+                }
+            };
+
+            for (channel, transmitter) in transmitter_arc.iter() {
+                // This will broadcast to any customer service agent connected to the same channel.
+                if message_data.channel != *channel {
+                    continue;
+                }
+
+                let _message = WSMessage {
+                    channel: message_data.channel,
+                    message: GPTMessage {
+                        role,
+                        content: message_data.message.content.clone(),
+                    },
                 };
 
-                for (channel, transmitter) in transmitter_arc.iter() {
-                    // This will broadcast to any customer service agent connected to the same channel.
-                    if message_data.channel != *channel {
-                        continue;
-                    }
+                let _ = transmitter.send(_message.clone());
 
-                    let _message = WSMessage {
-                        channel: message_data.channel,
-                        message: GPTMessage {
-                            role,
-                            content: message_data.message.content.clone(),
-                        },
+                // Save message to database.
+
+                // TODO: Investigate performance implications of querying while locking.
+                let mut channels = state.channels.lock().await;
+                let channel_state = channels.get_mut(&channel).unwrap();
+
+                channel_state.save_message(_message.clone(), &pool).await;
+
+                if role != MessageRole::Assistant {
+                    let openai_response = query_to_openai(channel_state.messages.clone()).await;
+
+                    let ai_message = openai_response.choices[0].message.clone();
+
+                    let channel_ai_message = WSMessage {
+                        channel: _message.channel,
+                        message: ai_message,
                     };
+                    let _ = transmitter.send(channel_ai_message.clone());
 
-                    let _ = transmitter.send(_message.clone());
+                    channel_state.save_message(channel_ai_message, &pool).await;
+                }
+            }
+        }
+    });
 
-                    // Save message to database.
-
-                    // TODO: Investigate performance implications of querying while locking.
-                    let mut channels = state.channels.lock().await;
-                    let channel_state = channels.get_mut(&channel).unwrap();
-
-                    channel_state.save_message(_message.clone(), &pool).await;
-
-                    if role != MessageRole::Assistant {
-                        let openai_response = query_to_openai(channel_state.messages.clone()).await;
-
-                        let ai_message = openai_response.choices[0].message.clone();
-
-                        let channel_ai_message = WSMessage {
-                            channel: _message.channel,
-                            message: ai_message,
-                        };
-                        let _ = transmitter.send(channel_ai_message.clone());
-
-                        channel_state.save_message(channel_ai_message, &pool).await;
+    if let Some(mut agent_receiver) = agent_receiver {
+        // TODO: DROP TASK
+        let agent_rx_task = tokio::spawn(async move {
+            while let Some(action) = agent_receiver.recv().await {
+                match action {
+                    SingleAgentAction::AddChat((channel, transmitter)) => {
+                        // TODO: DROP TASK
+                        let task = start_channel_listener(channel, transmitter, sender_arc.clone());
                     }
                 }
             }
-        })
-    };
-
+        });
+    }
     // If the sender task fails, then disconnect all clients.
     tokio::select! {
         _ = (&mut recv_task) =>
@@ -164,9 +160,13 @@ pub async fn handle_socket(
     };
 }
 
+struct MultipleChannelResult {
+    channels: Vec<(Uuid, ChannelTransmitter)>,
+    agent_receiver: mpsc::Receiver<SingleAgentAction>,
+}
 pub enum FirstMessageResult {
-    ContinueSingleChannel((Uuid, broadcast::Sender<WSMessage>)),
-    ContinueMultipleChannels(Vec<(Uuid, broadcast::Sender<WSMessage>)>),
+    ContinueSingleChannel((Uuid, ChannelTransmitter)),
+    ContinueMultipleChannels(MultipleChannelResult),
     Break,
 }
 
@@ -180,6 +180,7 @@ pub async fn handle_first_message(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     pool: &Pool<Postgres>,
     state: &Arc<AppState>,
+    agent_tx: &mpsc::Sender<AgentPoolAction>,
 ) -> FirstMessageResult {
     let channel: Uuid;
 
@@ -201,6 +202,7 @@ pub async fn handle_first_message(
             match parsed_message.message_type {
                 FirstMessageType::NewUUID => {
                     let Ok(result) =
+                        // TODO: FILTER BY COMPANY ID
                         sqlx::query!("INSERT INTO chat (company_id) VALUES ($1) RETURNING id", 1)
                             .fetch_one(pool)
                             .await
@@ -261,26 +263,29 @@ pub async fn handle_first_message(
                     };
 
                     //Add agent to agent_pool in app state
-                    {
-                        let mut agent_pool = state.agent_pool.lock().await;
-                        let agents = agent_pool
-                            .entry(token_data.claims.company_id)
-                            .or_insert(vec![]);
+                    let (agent_sender, agent_receiver) =
+                        mpsc::channel::<SingleAgentAction>(AGENT_CHANNEL_BUFFER.into());
 
-                        agents.push(token_data.claims);
-                    }
+                    agent_tx
+                        .send(AgentPoolAction::AddAgent((
+                            token_data.claims.to_owned(),
+                            agent_sender,
+                        )))
+                        .await
+                        .unwrap();
 
                     // Get all channels for this company.
                     // TODO: FILTER BY COMPANY ID
-                    return FirstMessageResult::ContinueMultipleChannels(
-                        state
+                    return FirstMessageResult::ContinueMultipleChannels(MultipleChannelResult {
+                        channels: state
                             .channels
                             .lock()
                             .await
                             .iter()
                             .map(|c| (c.0.clone(), c.1.transmitter.clone()))
                             .collect(),
-                    );
+                        agent_receiver,
+                    });
                 }
             }
 
@@ -305,4 +310,136 @@ pub async fn handle_first_message(
     }
 
     return FirstMessageResult::Break;
+}
+
+fn start_channel_listener(
+    channel: Uuid,
+    transmitter: ChannelTransmitter,
+    sender: Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rx = transmitter.subscribe();
+        // Send messages from other clients to this client.
+
+        while let Ok(msg) = rx.recv().await {
+            if msg.channel != channel {
+                continue;
+            }
+
+            // In any websocket error, break loop.
+            if sender
+                .lock()
+                .await
+                .send(Message::Text(serde_json::to_string(&msg).unwrap()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+pub fn agent_pool_task(
+    app_state: Arc<AppState>,
+    mut agent_receiver: mpsc::Receiver<AgentPoolAction>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(agent_action) = agent_receiver.recv().await {
+            let app_state = app_state.clone();
+
+            match agent_action {
+                AgentPoolAction::AddAgent((agent, agent_sender)) => {
+                    {
+                        let mut agent_pool = app_state.agent_pool.lock().await;
+                        let agents = agent_pool
+                            .entry(Company(agent.company_id))
+                            .or_insert(vec![]);
+
+                        agents.push((agent.clone(), agent_sender.clone()));
+                    }
+
+                    {
+                        assign_chats_to_agent(agent, app_state).await;
+                    }
+                }
+
+                AgentPoolAction::RemoveAgent(removed_agent) => {
+                    let mut agent_pool = app_state.agent_pool.lock().await;
+                    let agents = agent_pool
+                        .entry(Company(removed_agent.company_id))
+                        .or_default();
+
+                    for (index, agent_in_pool) in agents.iter().enumerate() {
+                        if agent_in_pool.0.id == removed_agent.id {
+                            agents.remove(index);
+                            break;
+                        }
+                    }
+
+                    {
+                        // Get the agent with the least amount of chats.
+                        let mut chats_per_agent =
+                            get_chats_per_agent(app_state.clone(), removed_agent.company_id).await;
+
+                        chats_per_agent.sort_unstable_by_key(|x| x.1);
+
+                        let mut channels = app_state.channels.lock().await;
+
+                        // Assign all chats from the removed agent to the agent with the least amount of chats.
+                        if let Some((agent, _)) = chats_per_agent.first() {
+                            for (_, channel_state) in channels.iter_mut() {
+                                if channel_state.current_agent.as_ref().is_some_and(
+                                    |current_agent| current_agent.id == removed_agent.id,
+                                ) {
+                                    channel_state.current_agent = Some(agent.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                AgentPoolAction::AssignChat(company, channel) => {
+                    let mut chats_per_agent =
+                        get_chats_per_agent(app_state.clone(), company.0).await;
+
+                    chats_per_agent.sort_unstable_by_key(|x| x.1);
+
+                    let mut channels = app_state.channels.lock().await;
+
+                    if let Some((agent, _)) = chats_per_agent.first() {
+                        let channel_state = channels.get_mut(&channel).unwrap();
+
+                        channel_state.current_agent = Some(agent.to_owned());
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn assign_chats_to_agent(agent: PublicAccountData, app_state: Arc<AppState>) {
+    let mut channels = app_state.channels.lock().await;
+    let channels_vec = channels
+        .iter_mut()
+        .filter(|x| x.1.company_id == agent.company_id && x.1.current_agent.is_none())
+        .collect::<Vec<_>>();
+
+    for (channel, channel_state) in channels_vec {
+        channel_state.current_agent = Some(agent.clone());
+
+        channel_state
+            .transmitter
+            .send(WSMessage {
+                channel: channel.to_owned(),
+                message: GPTMessage {
+                    role: MessageRole::Status,
+                    content: format!(
+                        "El agente {} {} ha sido asignado al chat.",
+                        agent.first_name, agent.last_name
+                    ),
+                },
+            })
+            .unwrap();
+    }
 }

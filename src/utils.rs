@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use axum::Json;
 use jsonwebtoken::{errors::Error, TokenData};
 use reqwest::Client;
 use sqlx::PgPool;
 
 use crate::structs::{
-    Account, ChatCompletion, GPTMessage, GPTRequest, MessageRole, PublicAccountData, RegisterData,
+    Account, AppState, ChatCompletion, Company, GPTMessage, GPTRequest, MessageRole,
+    PublicAccountData, RegisterData,
 };
 
 const HASH_SALT: u32 = 12;
@@ -93,4 +96,35 @@ pub fn get_secret_key() -> String {
 NppDoepf5Y0l7mDuTUp0dw=="
             .to_string(),
     )
+}
+
+/// Returns a vector of tuples with the agent id and the number of chats they are currently in.
+pub async fn get_chats_per_agent(
+    app_state: Arc<AppState>,
+    company_id: i32,
+) -> Vec<(PublicAccountData, usize)> {
+    let channels = app_state.channels.lock().await;
+    let agents = app_state.agent_pool.lock().await;
+
+    let company_agents = agents.get(&Company(company_id)).unwrap();
+
+    let agent_chats = company_agents
+        .iter()
+        .map(|agent| {
+            (
+                agent.0.to_owned(),
+                channels
+                    .iter()
+                    .filter(|(_, channel)| {
+                        channel
+                            .current_agent
+                            .as_ref()
+                            .is_some_and(|current_agent| current_agent.id == agent.0.id)
+                    })
+                    .count(),
+            )
+        })
+        .collect();
+
+    return agent_chats;
 }

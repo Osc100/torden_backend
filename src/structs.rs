@@ -4,6 +4,7 @@ use sqlx::FromRow;
 use sqlx::{types::Uuid, Pool, Postgres};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::{broadcast, Mutex};
 
 #[derive(Serialize, Deserialize)]
@@ -30,23 +31,29 @@ pub struct Choice {
     pub index: u8,
 }
 
-#[derive(sqlx::Type, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[derive(sqlx::Type, Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 #[sqlx(type_name = "message_role", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
+    /// Client messages
     User,
+    /// GPT system messages
     System,
+    /// Status messages like client or agent connections
+    Status,
+    /// Messages from the AI
     Assistant,
+    /// Messages from the chat agent
     Agent,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GPTMessage {
     pub role: MessageRole,
     pub content: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WSMessage {
     pub channel: Uuid,
     pub message: GPTMessage,
@@ -103,6 +110,7 @@ pub struct RegisterData {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PublicAccountData {
     // to user only lmao
+    pub id: i32,
     pub email: String,
     pub first_name: String,
     pub last_name: String,
@@ -115,6 +123,7 @@ pub struct PublicAccountData {
 impl From<&Account> for PublicAccountData {
     fn from(account: &Account) -> Self {
         PublicAccountData {
+            id: account.id,
             email: account.email.clone(),
             first_name: account.first_name.clone(),
             last_name: account.last_name.clone(),
@@ -141,18 +150,37 @@ pub enum AccountRole {
     Superuser = 2,
 }
 
+#[derive(PartialEq, Hash, Eq)]
+pub struct Company(pub i32);
+
+#[derive(Clone)]
 pub struct AppState {
     pub channels: Arc<Mutex<HashMap<Uuid, ChannelState>>>,
     /// Company ID -> Vec<PublicAccountData>
-    pub agent_pool: Arc<Mutex<HashMap<i32, Vec<PublicAccountData>>>>,
+    pub agent_pool:
+        Arc<Mutex<HashMap<Company, Vec<(PublicAccountData, mpsc::Sender<SingleAgentAction>)>>>>,
 }
+
+pub type ChannelTransmitter = broadcast::Sender<WSMessage>;
 
 #[derive(Clone)]
 pub struct ChannelState {
     pub messages: Vec<GPTMessage>,
+    pub company_id: i32,
     pub current_agent: Option<PublicAccountData>,
     pub stopped_ai: bool,
-    pub transmitter: broadcast::Sender<WSMessage>,
+    pub transmitter: ChannelTransmitter,
+}
+/// Actions in the entire agent pool.
+pub enum AgentPoolAction {
+    AddAgent((PublicAccountData, mpsc::Sender<SingleAgentAction>)),
+    RemoveAgent(PublicAccountData),
+    AssignChat(Company, Uuid),
+}
+
+/// Actions for a single agent
+pub enum SingleAgentAction {
+    AddChat((Uuid, ChannelTransmitter)),
 }
 
 impl ChannelState {
@@ -166,11 +194,18 @@ impl ChannelState {
         .await
         .unwrap();
 
+        let company_id = sqlx::query!(r#"SELECT company_id FROM chat WHERE id = $1"#, uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .company_id;
+
         Self {
             messages,
+            company_id,
             current_agent: None,
             stopped_ai: false,
-            transmitter: broadcast::channel(2).0,
+            transmitter: broadcast::channel(3).0,
         }
     }
 
