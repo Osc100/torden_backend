@@ -27,7 +27,8 @@ async fn main() {
         // .with(tracing_subscriber::EnvFilter::new(
         //     std::env::var("RUST_LOG").unwrap_or_else(|_| "example_chat=trace".into()),
         // ))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer().pretty())
         .init();
 
     // Arc is a thread-safe reference-counted pointer, used to share state between threads.
@@ -55,7 +56,7 @@ async fn main() {
     .unwrap();
 
     let (agent_tx, agent_rx) = mpsc::channel::<AgentPoolAction>(100);
-    let agent_task = agent_pool_task(app_state.clone(), agent_rx);
+    let agent_task = agent_pool_task(app_state.clone(), agent_rx, agent_tx.clone(), pool.clone());
 
     let app = Router::new()
         .route("/chat", get(ws_handler))

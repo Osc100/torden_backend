@@ -175,12 +175,14 @@ pub struct ChannelState {
 pub enum AgentPoolAction {
     AddAgent((PublicAccountData, mpsc::Sender<SingleAgentAction>)),
     RemoveAgent(PublicAccountData),
-    AssignChat(Company, Uuid),
+    NewChat(Company, Uuid),
+    DropChat(Uuid),
 }
 
 /// Actions for a single agent
 pub enum SingleAgentAction {
-    AddChat((Uuid, ChannelTransmitter)),
+    AddChat((Uuid, ChannelState)),
+    RemoveChat((Uuid, ChannelTransmitter)),
 }
 
 impl ChannelState {
@@ -205,11 +207,15 @@ impl ChannelState {
             company_id,
             current_agent: None,
             stopped_ai: false,
-            transmitter: broadcast::channel(3).0,
+            transmitter: broadcast::channel(10).0,
         }
     }
 
-    pub async fn save_message(&mut self, ws_message: WSMessage, pool: &Pool<Postgres>) {
+    pub async fn save_message(
+        &mut self,
+        ws_message: WSMessage,
+        pool: &Pool<Postgres>,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "INSERT INTO message (chat_id, role, text) VALUES ($1, $2, $3)",
             ws_message.channel,
@@ -217,9 +223,20 @@ impl ChannelState {
             ws_message.message.content
         )
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
 
         self.messages.push(ws_message.message);
+        Ok(())
+    }
+
+    pub async fn send_and_save_message(
+        &mut self,
+        ws_message: WSMessage,
+        pool: &Pool<Postgres>,
+    ) -> Result<(), sqlx::Error> {
+        self.transmitter.send(ws_message.clone()).unwrap();
+        self.save_message(ws_message, pool).await?;
+
+        Ok(())
     }
 }

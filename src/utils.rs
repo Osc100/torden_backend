@@ -49,6 +49,22 @@ pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<Cha
         The startup doesn't have a fisical location yet and will make it's official annoucement in the Hackathon Nicaragua 2023"#.to_string(),
     };
 
+    // Filter internal MessageRole to something supported by the OpenAI API.
+    let conversation_messages: Vec<GPTMessage> = conversation_messages
+        .iter()
+        .filter(|x| x.role != MessageRole::Status)
+        .map(|x| {
+            if x.role == MessageRole::Agent {
+                GPTMessage {
+                    role: MessageRole::Assistant,
+                    content: x.content.to_owned(),
+                }
+            } else {
+                x.to_owned()
+            }
+        })
+        .collect();
+
     let request_messages = if conversation_messages
         .first()
         .is_some_and(|x| x.role == MessageRole::System)
@@ -70,6 +86,9 @@ pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<Cha
         .json(&request_data)
         .send()
         .await
+        .map_err(|e| {
+            tracing::error!("Error sending request to OpenAI: {}", e);
+        })
         .unwrap();
 
     Json(response.json::<ChatCompletion>().await.unwrap())
@@ -107,7 +126,9 @@ pub async fn get_chats_per_agent(
     let channels = app_state.channels.lock().await;
     let agents = app_state.agent_pool.lock().await;
 
-    let company_agents = agents.get(&Company(company_id)).unwrap();
+    let Some(company_agents) = agents.get(&Company(company_id)) else {
+        return vec![];
+    };
 
     let agent_chats = company_agents
         .iter()

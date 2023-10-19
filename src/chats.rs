@@ -31,8 +31,8 @@ pub async fn ws_handler(
     Extension(agent_tx): Extension<mpsc::Sender<AgentPoolAction>>,
 ) -> Response {
     let addr_string = addr.ip().to_string();
-    println!("{} ", addr_string);
-    println!("at {addr} connected.");
+    tracing::info!("{} ", addr_string);
+    tracing::info!("at {addr} connected.");
 
     ws.on_upgrade(move |socket| handle_socket(socket, addr, state, pool, agent_tx))
 }
@@ -73,7 +73,7 @@ pub async fn handle_socket(
     let sender_arc = Arc::new(Mutex::new(sender));
     let mut send_task_vec = vec![];
 
-    {
+    if agent_data.is_none() {
         let transmitters = transmitters.clone();
         // let state = state.clone();
         // let pool = pool.clone();
@@ -90,75 +90,152 @@ pub async fn handle_socket(
     let transmitter_arc = Arc::new(transmitters);
     // Clone things we want to pass to the receiving task.
     // This task will receive messages from client and send them to broadcast subscribers.
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            let message_data = match serde_json::from_str::<WSMessage>(&text) {
-                Ok(message_data) => message_data,
-                Err(err) => {
-                    tracing::error!("Error parsing message: {}", err);
+    let mut recv_task = {
+        let state = state.clone();
+        let agent_data_id = match agent_data.clone() {
+            Some(agent_data) => Some(agent_data.id),
+            None => None,
+        };
+        let transmitter_arc = transmitter_arc.clone();
 
-                    continue;
-                }
-            };
+        tokio::spawn(async move {
+            while let Some(Ok(Message::Text(text))) = receiver.next().await {
+                let message_data = match serde_json::from_str::<WSMessage>(&text) {
+                    Ok(message_data) => message_data,
+                    Err(err) => {
+                        tracing::error!("Error parsing message: {}", err);
 
-            for (channel, transmitter) in transmitter_arc.iter() {
-                // This will broadcast to any customer service agent connected to the same channel.
-                if message_data.channel != *channel {
-                    continue;
-                }
-
-                let _message = WSMessage {
-                    channel: message_data.channel,
-                    message: GPTMessage {
-                        role,
-                        content: message_data.message.content.clone(),
-                    },
+                        continue;
+                    }
                 };
 
-                let _ = transmitter.send(_message.clone());
+                tracing::info!("{:#?} ", message_data);
 
-                // Save message to database.
+                let channels_to_chat: Vec<Uuid> = if let Some(agent_data_id) = agent_data_id {
+                    let state_channels = state.channels.lock().await;
 
-                // TODO: Investigate performance implications of querying while locking.
-                let mut channels = state.channels.lock().await;
-                let channel_state = channels.get_mut(&channel).unwrap();
+                    let filtered_channels = state_channels.iter().filter(|x| {
+                        x.1.current_agent
+                            .as_ref()
+                            .is_some_and(|current_agent| current_agent.id == agent_data_id)
+                    });
 
-                channel_state.save_message(_message.clone(), &pool).await;
+                    filtered_channels.map(|x| x.0.to_owned()).collect()
+                } else {
+                    transmitter_arc.iter().map(|x| (x.0)).collect()
+                };
 
-                if role != MessageRole::Assistant {
-                    let openai_response = query_to_openai(channel_state.messages.clone()).await;
+                for channel in channels_to_chat {
+                    // This will broadcast to any customer service agent connected to the same channel.
+                    if message_data.channel != channel {
+                        continue;
+                    }
 
-                    let ai_message = openai_response.choices[0].message.clone();
-
-                    let channel_ai_message = WSMessage {
-                        channel: _message.channel,
-                        message: ai_message,
+                    let _message = WSMessage {
+                        channel: message_data.channel,
+                        message: GPTMessage {
+                            role,
+                            content: message_data.message.content.clone(),
+                        },
                     };
-                    let _ = transmitter.send(channel_ai_message.clone());
 
-                    channel_state.save_message(channel_ai_message, &pool).await;
+                    let mut channels = state.channels.lock().await;
+                    let channel_state = channels.get_mut(&channel).unwrap();
+
+                    channel_state
+                        .send_and_save_message(_message.clone(), &pool)
+                        .await
+                        .unwrap();
+
+                    // TODO: Investigate performance implications of querying while locking.
+
+                    if role == MessageRole::User && !channel_state.stopped_ai {
+                        let openai_response = query_to_openai(channel_state.messages.clone()).await;
+
+                        let ai_message = openai_response.choices[0].message.clone();
+
+                        let channel_ai_message = WSMessage {
+                            channel: _message.channel,
+                            message: ai_message,
+                        };
+
+                        channel_state
+                            .send_and_save_message(channel_ai_message, &pool)
+                            .await
+                            .unwrap();
+                    }
                 }
             }
-        }
-    });
+        })
+    };
 
     let mut agent_rx_task: Option<JoinHandle<()>> = None;
-    let agent_extra_tasks = Arc::new(Mutex::new(vec![]));
+    let agent_extra_tasks: Arc<Mutex<Vec<(Uuid, JoinHandle<()>)>>> = Arc::new(Mutex::new(vec![]));
 
     if let Some(mut agent_receiver) = agent_receiver {
         let agent_extra_tasks = agent_extra_tasks.clone();
-        let tmp_task = tokio::spawn(async move {
+        let new_task = tokio::spawn(async move {
             while let Some(action) = agent_receiver.recv().await {
                 match action {
-                    SingleAgentAction::AddChat((channel, transmitter)) => {
-                        let task = start_channel_listener(channel, transmitter, sender_arc.clone());
-                        agent_extra_tasks.lock().await.push(task);
+                    SingleAgentAction::AddChat((channel, channel_state)) => {
+                        // Send the messages to the agent.
+                        let sender_arc = sender_arc.clone();
+                        let _ = sender_arc
+                            .lock()
+                            .await
+                            .send(
+                                Message::Text(
+                                    serde_json::to_string(
+                                        &channel_state
+                                            .messages
+                                            .iter()
+                                            .map(|c| WSMessage {
+                                                channel: channel.to_owned(),
+                                                message: c.to_owned(),
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .unwrap(),
+                                )
+                                .into(),
+                            )
+                            .await;
+
+                        // Start task.
+                        let task = start_channel_listener(
+                            channel.clone(),
+                            channel_state.transmitter,
+                            sender_arc,
+                        );
+                        agent_extra_tasks.lock().await.push((channel, task));
+                    }
+                    SingleAgentAction::RemoveChat((channel_to_remove, transmitter)) => {
+                        transmitter
+                            .send(WSMessage {
+                                channel: channel_to_remove.to_owned(),
+                                message: GPTMessage {
+                                    role: MessageRole::Status,
+                                    content: "El cliente ha abandonado el chat.".to_string(),
+                                },
+                            })
+                            .unwrap();
+
+                        for (channel, task) in agent_extra_tasks.lock().await.iter_mut() {
+                            if channel_to_remove == channel.to_owned() {
+                                task.abort();
+                                agent_extra_tasks
+                                    .lock()
+                                    .await
+                                    .retain(|x| x.0 != channel.to_owned());
+                                break;
+                            }
+                        }
                     }
                 }
             }
         });
 
-        agent_rx_task = Some(tmp_task);
+        agent_rx_task = Some(new_task);
     }
     // If the client disconnects, then...
     // Cancel all tasks.
@@ -168,13 +245,17 @@ pub async fn handle_socket(
             send_task_vec.iter_mut().for_each(|send_task| send_task.abort());
             if let Some(agent_rx_task) = agent_rx_task {
                 agent_rx_task.abort();
-
-                if let Some(account) = agent_data {
-                    agent_tx.send(AgentPoolAction::RemoveAgent(account)).await.unwrap();
-                }
-
             }
-            for task in agent_extra_tasks.lock().await.iter_mut() {
+
+            if let Some(account) = agent_data {
+                agent_tx.send(AgentPoolAction::RemoveAgent(account)).await.unwrap();
+            }
+            else {
+            // drop since is a user
+                agent_tx.send(AgentPoolAction::DropChat(transmitter_arc[0].0)).await.unwrap();
+            }
+
+            for (_, task) in agent_extra_tasks.lock().await.iter_mut() {
                 task.abort();
             }
         }
@@ -208,7 +289,7 @@ pub async fn handle_first_message(
 
     while let Some(Ok(first_message)) = receiver.next().await {
         if let Message::Text(first_message_string) = first_message {
-            println!("{} first_message ", first_message_string.clone());
+            tracing::info!("{} first_message ", first_message_string.clone());
 
             // serde_json::from_str::<FirstMessage>(&first_message_string).unwrap();
 
@@ -239,6 +320,11 @@ pub async fn handle_first_message(
                     };
 
                     channel = result.id;
+                    agent_tx
+                        .send(AgentPoolAction::NewChat(Company(1), channel))
+                        .await
+                        .unwrap();
+
                     // Sends the UUID to the client.
                     sender
                         .send(Message::Text(
@@ -313,20 +399,7 @@ pub async fn handle_first_message(
             }
 
             {
-                let mut channels = state.channels.lock().await;
-
-                let channel_state = channels
-                    .entry(channel.clone())
-                    .or_insert(ChannelState::from_db(pool.clone(), channel.clone()).await);
-
-                let transmitter = Some(channel_state.transmitter.clone()).unwrap();
-                let messages = channel_state.messages.clone();
-                // Send all existing messages to the client.
-                sender
-                    .send(Message::Text(serde_json::to_string(&messages).unwrap()))
-                    .await
-                    .unwrap();
-
+                let transmitter = load_channel_messages(state, pool, channel, sender).await;
                 return FirstMessageResult::ContinueSingleChannel((channel, transmitter));
             }
         }
@@ -363,9 +436,35 @@ fn start_channel_listener(
     })
 }
 
+/// Gets or creates a channel in the app state, then sends all existing messages to the client, returning the transmitter.
+pub async fn load_channel_messages(
+    state: &Arc<AppState>,
+    pool: &Pool<Postgres>,
+    channel: Uuid,
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+) -> ChannelTransmitter {
+    let mut channels = state.channels.lock().await;
+
+    let channel_state = channels
+        .entry(channel.clone())
+        .or_insert(ChannelState::from_db(pool.clone(), channel.clone()).await);
+
+    let transmitter = Some(channel_state.transmitter.clone()).unwrap();
+    let messages = channel_state.messages.clone();
+    // Send all existing messages to the client.
+    sender
+        .send(Message::Text(serde_json::to_string(&messages).unwrap()))
+        .await
+        .unwrap();
+
+    return transmitter;
+}
+
 pub fn agent_pool_task(
     app_state: Arc<AppState>,
     mut agent_receiver: mpsc::Receiver<AgentPoolAction>,
+    agent_sender: mpsc::Sender<AgentPoolAction>,
+    pool: Pool<Postgres>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(agent_action) = agent_receiver.recv().await {
@@ -383,7 +482,15 @@ pub fn agent_pool_task(
                     }
 
                     {
-                        assign_chats_to_agent(agent, app_state).await;
+                        let assigned_chats =
+                            unassigned_chats_asign_agent(agent, app_state, &pool).await;
+
+                        for (channel, channel_state) in assigned_chats {
+                            agent_sender
+                                .send(SingleAgentAction::AddChat((channel, channel_state)))
+                                .await
+                                .unwrap()
+                        }
                     }
                 }
 
@@ -400,36 +507,28 @@ pub fn agent_pool_task(
                         }
                     }
 
-                    {
-                        // Get the agent with the least amount of chats.
-                        let mut chats_per_agent =
-                            get_chats_per_agent(app_state.clone(), removed_agent.company_id).await;
+                    let mut channels = app_state.channels.lock().await;
+                    // Get the agent with the least amount of chats.
+                    let assigned_chats = channels.iter_mut().filter(|x| {
+                        x.1.current_agent
+                            .as_ref()
+                            .is_some_and(|ca| ca.id == removed_agent.id)
+                    });
 
-                        chats_per_agent.sort_unstable_by_key(|x| x.2);
+                    for chat in assigned_chats {
+                        chat.1.current_agent = None;
 
-                        let mut channels = app_state.channels.lock().await;
-
-                        // Assign all chats from the removed agent to the agent with the least amount of chats.
-                        if let Some((agent, agent_channel, _)) = chats_per_agent.first() {
-                            for (channel, channel_state) in channels.iter_mut() {
-                                if channel_state.current_agent.as_ref().is_some_and(
-                                    |current_agent| current_agent.id == removed_agent.id,
-                                ) {
-                                    agent_channel
-                                        .send(SingleAgentAction::AddChat((
-                                            channel.to_owned(),
-                                            channel_state.transmitter.clone(),
-                                        )))
-                                        .await
-                                        .unwrap();
-                                    channel_state.current_agent = Some(agent.to_owned());
-                                }
-                            }
-                        }
+                        agent_sender
+                            .send(AgentPoolAction::NewChat(
+                                Company(removed_agent.company_id),
+                                chat.0.to_owned(),
+                            ))
+                            .await
+                            .unwrap();
                     }
                 }
 
-                AgentPoolAction::AssignChat(company, channel) => {
+                AgentPoolAction::NewChat(company, channel) => {
                     let mut chats_per_agent =
                         get_chats_per_agent(app_state.clone(), company.0).await;
 
@@ -442,7 +541,7 @@ pub fn agent_pool_task(
                         agent_channel
                             .send(SingleAgentAction::AddChat((
                                 channel.to_owned(),
-                                channel_state.transmitter.clone(),
+                                channel_state.to_owned(),
                             )))
                             .await
                             .unwrap();
@@ -450,33 +549,90 @@ pub fn agent_pool_task(
                         channel_state.current_agent = Some(agent.to_owned());
                     }
                 }
+
+                AgentPoolAction::DropChat(channel) => {
+                    let removed_channel = app_state.channels.lock().await.remove(&channel);
+                    let app_state = app_state.clone();
+
+                    match removed_channel {
+                        Some(state) => {
+                            if let Some(agent_to_remove) = state.current_agent {
+                                let mut agent_pool = app_state.agent_pool.lock().await;
+
+                                let agent_list = agent_pool
+                                    .entry(Company(agent_to_remove.company_id))
+                                    .or_default()
+                                    .iter();
+
+                                for (agent, agent_sender) in agent_list {
+                                    if agent_to_remove.id == agent.id {
+                                        agent_sender
+                                            .send(SingleAgentAction::RemoveChat((
+                                                channel,
+                                                state.transmitter,
+                                            )))
+                                            .await
+                                            .unwrap();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        None => continue,
+                    }
+                }
             }
         }
     })
 }
 
-async fn assign_chats_to_agent(agent: PublicAccountData, app_state: Arc<AppState>) {
+// async fn get_empty_channels_for_company(
+//     channels: MutexGuard<'_, HashMap<Uuid, ChannelState>>,
+//     company_id: i32,
+// ) -> Vec<(Uuid, ChannelState)> {
+//     channels
+//         .iter()
+//         .filter(|x| x.1.company_id == company_id && x.1.current_agent.is_none())
+//         .map(|x| (x.0.to_owned(), x.1.to_owned()))
+//         .collect()
+// }
+
+async fn unassigned_chats_asign_agent(
+    agent: PublicAccountData,
+    app_state: Arc<AppState>,
+    pool: &Pool<Postgres>,
+) -> Vec<(Uuid, ChannelState)> {
     let mut channels = app_state.channels.lock().await;
-    let channels_vec = channels
+
+    let mutable_channels_vec: Vec<_> = channels
         .iter_mut()
         .filter(|x| x.1.company_id == agent.company_id && x.1.current_agent.is_none())
-        .collect::<Vec<_>>();
+        .collect();
 
-    for (channel, channel_state) in channels_vec {
+    let inmutable_channels_vec: Vec<(Uuid, ChannelState)> = mutable_channels_vec
+        .iter()
+        .map(|x| (*x.0, x.1.to_owned()))
+        .collect();
+
+    for (channel, channel_state) in mutable_channels_vec {
         channel_state.current_agent = Some(agent.clone());
-
         channel_state
-            .transmitter
-            .send(WSMessage {
-                channel: channel.to_owned(),
-                message: GPTMessage {
-                    role: MessageRole::Status,
-                    content: format!(
-                        "El agente {} {} ha sido asignado al chat.",
-                        agent.first_name, agent.last_name
-                    ),
+            .send_and_save_message(
+                WSMessage {
+                    channel: channel.to_owned(),
+                    message: GPTMessage {
+                        role: MessageRole::Status,
+                        content: format!(
+                            "El agente {} {} ha sido asignado al chat.",
+                            agent.first_name, agent.last_name
+                        ),
+                    },
                 },
-            })
+                &pool,
+            )
+            .await
             .unwrap();
     }
+
+    return inmutable_channels_vec;
 }
