@@ -1,0 +1,3 @@
+ALTER TABLE chat 
+ADD COLUMN ai_description TEXT NULL,
+ADD COLUMN client_name VARCHAR(254) NULL;

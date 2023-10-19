@@ -53,6 +53,16 @@ pub struct GPTMessage {
     pub content: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Chat {
+    pub id: Uuid,
+    pub created: chrono::NaiveDateTime,
+    pub company_id: i32,
+    // pub agents: Option<Vec<GPTMessage>>,
+    pub ai_description: Option<String>,
+    pub client_name: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WSMessage {
     pub channel: Uuid,

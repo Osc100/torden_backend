@@ -1,4 +1,4 @@
-use crate::structs::{Account, AccountResponse, PublicAccountData, RegisterData};
+use crate::structs::{Account, AccountResponse, Chat, PublicAccountData, RegisterData};
 use crate::utils::{generate_jwt, register_user};
 use axum::http::StatusCode;
 use axum::{response::IntoResponse, Extension, Json};
@@ -81,3 +81,11 @@ pub async fn register_handler(
     );
 }
 
+pub async fn chat_history(Extension(pool): Extension<sqlx::PgPool>) -> impl IntoResponse {
+    let chats = sqlx::query_as!(Chat, "SELECT * FROM chat")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+    return (StatusCode::OK, Json(json!(chats)));
+}
