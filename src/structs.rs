@@ -1,3 +1,4 @@
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use sqlx::FromRow;
@@ -6,6 +7,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, Mutex};
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAIRole {
+    System,
+    User,
+    Assistant,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OpenAIMessage {
+    pub role: OpenAIRole,
+    pub content: String,
+}
+
+impl From<OpenAIMessage> for GPTMessage {
+    fn from(value: OpenAIMessage) -> Self {
+        Self {
+            account_id: None,
+            role: MessageRole::Assistant,
+            content: value.content.clone(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct ChatCompletion {
@@ -26,7 +51,7 @@ pub struct Usage {
 
 #[derive(Serialize, Deserialize)]
 pub struct Choice {
-    pub message: GPTMessage,
+    pub message: OpenAIMessage,
     pub finish_reason: String,
     pub index: u8,
 }
@@ -47,10 +72,32 @@ pub enum MessageRole {
     Agent,
 }
 
+impl Into<OpenAIRole> for MessageRole {
+    fn into(self) -> OpenAIRole {
+        match self {
+            MessageRole::Agent => OpenAIRole::Assistant,
+            MessageRole::Status => OpenAIRole::System,
+            MessageRole::Assistant => OpenAIRole::Assistant,
+            MessageRole::System => OpenAIRole::System,
+            MessageRole::User => OpenAIRole::User,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GPTMessage {
+    pub account_id: Option<i32>,
     pub role: MessageRole,
     pub content: String,
+}
+
+impl Into<OpenAIMessage> for &GPTMessage {
+    fn into(self) -> OpenAIMessage {
+        OpenAIMessage {
+            role: self.role.into(),
+            content: self.content.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -64,15 +111,33 @@ pub struct Chat {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentPublicData {
+    id: i32,
+    first_name: String,
+    last_name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WSMessage {
     pub channel: Uuid,
     pub message: GPTMessage,
+    pub agent_data: Option<AgentPublicData>,
+}
+
+#[derive(Serialize)]
+pub struct DBMessage {
+    pub id: i32,
+    pub chat_id: Uuid,
+    pub role: MessageRole,
+    pub text: String,
+    pub created: NaiveDateTime,
+    pub account_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct GPTRequest {
     pub model: String,
-    pub messages: Vec<GPTMessage>,
+    pub messages: Vec<OpenAIMessage>,
     pub max_tokens: u16,
 }
 
@@ -119,7 +184,6 @@ pub struct RegisterData {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PublicAccountData {
-    // to user only lmao
     pub id: i32,
     pub email: String,
     pub first_name: String,
@@ -141,6 +205,16 @@ impl From<&Account> for PublicAccountData {
             company_id: account.company_id,
             created: account.created,
             exp: 1000000000000000,
+        }
+    }
+}
+
+impl From<&Account> for AgentPublicData {
+    fn from(value: &Account) -> Self {
+        Self {
+            id: value.id,
+            first_name: value.first_name.clone(),
+            last_name: value.last_name.clone(),
         }
     }
 }
@@ -173,14 +247,6 @@ pub struct AppState {
 
 pub type ChannelTransmitter = broadcast::Sender<WSMessage>;
 
-#[derive(Clone)]
-pub struct ChannelState {
-    pub messages: Vec<GPTMessage>,
-    pub company_id: i32,
-    pub current_agent: Option<PublicAccountData>,
-    pub stopped_ai: bool,
-    pub transmitter: ChannelTransmitter,
-}
 /// Actions in the entire agent pool.
 pub enum AgentPoolAction {
     AddAgent((PublicAccountData, mpsc::Sender<SingleAgentAction>)),
@@ -194,12 +260,20 @@ pub enum SingleAgentAction {
     AddChat((Uuid, ChannelState)),
     RemoveChat((Uuid, ChannelTransmitter)),
 }
+#[derive(Clone)]
+pub struct ChannelState {
+    pub messages: Vec<GPTMessage>,
+    pub company_id: i32,
+    pub current_agent: Option<PublicAccountData>,
+    pub stopped_ai: bool,
+    pub transmitter: ChannelTransmitter,
+}
 
 impl ChannelState {
     pub async fn from_db(pool: Pool<Postgres>, uuid: Uuid) -> Self {
         let messages = sqlx::query_as!(
             GPTMessage,
-            r#"SELECT role as "role: MessageRole", text as content FROM message WHERE chat_id = $1"#,
+            r#"SELECT account_id,role as "role: MessageRole", text as content FROM message WHERE chat_id = $1"#,
             uuid
         )
         .fetch_all(&pool)
@@ -226,11 +300,17 @@ impl ChannelState {
         ws_message: WSMessage,
         pool: &Pool<Postgres>,
     ) -> Result<(), sqlx::Error> {
+        let account_id = match ws_message.agent_data {
+            Some(agent_data) => Some(agent_data.id),
+            None => None,
+        };
+
         sqlx::query!(
-            "INSERT INTO message (chat_id, role, text) VALUES ($1, $2, $3)",
+            "INSERT INTO message (chat_id, role, text, account_id) VALUES ($1, $2, $3, $4)",
             ws_message.channel,
             ws_message.message.role as MessageRole,
-            ws_message.message.content
+            ws_message.message.content,
+            account_id
         )
         .execute(pool)
         .await?;
@@ -248,5 +328,45 @@ impl ChannelState {
         self.save_message(ws_message, pool).await?;
 
         Ok(())
+    }
+
+    pub async fn message_vec_to_ws_messages(
+        &self,
+        pool: &Pool<Postgres>,
+        channel: Uuid,
+    ) -> Result<Vec<WSMessage>, sqlx::Error> {
+        let mut ws_messages = Vec::new();
+        let agents = sqlx::query!(
+            r#"SELECT id, first_name, last_name FROM account WHERE company_id = $1 AND role = $2"#,
+            self.company_id,
+            AccountRole::Agent as _
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+
+        for message in &self.messages {
+            let agent_data: Option<AgentPublicData> = match message.account_id {
+                Some(account_id) => {
+                    agents
+                        .iter()
+                        .find(|&x| x.id == account_id)
+                        .map(|x| AgentPublicData {
+                            id: x.id,
+                            first_name: x.first_name.clone(),
+                            last_name: x.last_name.clone(),
+                        })
+                }
+                None => None,
+            };
+
+            ws_messages.push(WSMessage {
+                channel,
+                message: message.to_owned(),
+                agent_data,
+            })
+        }
+
+        Ok(ws_messages)
     }
 }

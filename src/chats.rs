@@ -97,6 +97,7 @@ pub async fn handle_socket(
             None => None,
         };
         let transmitter_arc = transmitter_arc.clone();
+        let pool = pool.clone();
 
         tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = receiver.next().await {
@@ -132,11 +133,11 @@ pub async fn handle_socket(
                     }
 
                     let _message = WSMessage {
-                        channel: message_data.channel,
                         message: GPTMessage {
                             role,
-                            content: message_data.message.content.clone(),
+                            ..message_data.message.clone()
                         },
+                        ..message_data.clone()
                     };
 
                     let mut channels = state.channels.lock().await;
@@ -156,7 +157,8 @@ pub async fn handle_socket(
 
                         let channel_ai_message = WSMessage {
                             channel: _message.channel,
-                            message: ai_message,
+                            message: ai_message.into(),
+                            agent_data: None,
                         };
 
                         channel_state
@@ -174,6 +176,8 @@ pub async fn handle_socket(
 
     if let Some(mut agent_receiver) = agent_receiver {
         let agent_extra_tasks = agent_extra_tasks.clone();
+        let pool = pool.clone();
+
         let new_task = tokio::spawn(async move {
             while let Some(action) = agent_receiver.recv().await {
                 match action {
@@ -187,13 +191,9 @@ pub async fn handle_socket(
                                 Message::Text(
                                     serde_json::to_string(
                                         &channel_state
-                                            .messages
-                                            .iter()
-                                            .map(|c| WSMessage {
-                                                channel: channel.to_owned(),
-                                                message: c.to_owned(),
-                                            })
-                                            .collect::<Vec<_>>(),
+                                            .message_vec_to_ws_messages(&pool, channel)
+                                            .await
+                                            .unwrap(),
                                     )
                                     .unwrap(),
                                 )
@@ -214,9 +214,11 @@ pub async fn handle_socket(
                             .send(WSMessage {
                                 channel: channel_to_remove.to_owned(),
                                 message: GPTMessage {
+                                    account_id: None,
                                     role: MessageRole::Status,
                                     content: "El cliente ha abandonado el chat.".to_string(),
                                 },
+                                agent_data: None,
                             })
                             .unwrap();
 
@@ -251,7 +253,7 @@ pub async fn handle_socket(
                 agent_tx.send(AgentPoolAction::RemoveAgent(account)).await.unwrap();
             }
             else {
-            // drop since is a user
+                // drop since is a user
                 agent_tx.send(AgentPoolAction::DropChat(transmitter_arc[0].0)).await.unwrap();
             }
 
@@ -615,6 +617,9 @@ async fn unassigned_chats_asign_agent(
         .collect();
 
     for (channel, channel_state) in mutable_channels_vec {
+        // let agent_name = format!("{} {}", agent.first_name, agent.last_name);
+        // let agent_id = agent.id;
+
         channel_state.current_agent = Some(agent.clone());
         channel_state
             .send_and_save_message(
@@ -626,7 +631,9 @@ async fn unassigned_chats_asign_agent(
                             "El agente {} {} ha sido asignado al chat.",
                             agent.first_name, agent.last_name
                         ),
+                        account_id: None,
                     },
+                    agent_data: None,
                 },
                 &pool,
             )

@@ -63,6 +63,7 @@ async fn main() {
         .route("/login", post(api::login_handler))
         .route("/register", post(api::register_handler))
         .route("/history", get(api::chat_history))
+        .route("/history/messages", get(api::chat_messages))
         .with_state(app_state)
         .layer(Extension(pool))
         .layer(Extension(agent_tx))

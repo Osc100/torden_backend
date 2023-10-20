@@ -7,8 +7,8 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 
 use crate::structs::{
-    Account, AppState, ChatCompletion, Company, GPTMessage, GPTRequest, MessageRole,
-    PublicAccountData, RegisterData, SingleAgentAction,
+    Account, AppState, ChatCompletion, Choice, Company, GPTMessage, GPTRequest, MessageRole,
+    OpenAIMessage, OpenAIRole, PublicAccountData, RegisterData, SingleAgentAction, Usage,
 };
 
 const HASH_SALT: u32 = 12;
@@ -39,8 +39,8 @@ pub async fn register_user(
 pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<ChatCompletion> {
     let client = Client::new();
 
-    let starter_message = GPTMessage {
-        role: MessageRole::System,
+    let starter_message = OpenAIMessage {
+        role: OpenAIRole::System,
         content: r#"
         You're a helpful sales representative who works in torden, an startup dedicated to automate customer service using LLMs. 
         Write short, helpful messages only about torden and politely decline questions about anything else.
@@ -49,25 +49,40 @@ pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<Cha
         The startup doesn't have a fisical location yet and will make it's official annoucement in the Hackathon Nicaragua 2023"#.to_string(),
     };
 
+    let dummy_message = ChatCompletion {
+        object: "ADW".to_string(),
+        created: 0,
+        model: "dwalkjd".to_string(),
+        choices: vec![Choice {
+            message: OpenAIMessage {
+                role: OpenAIRole::Assistant,
+                content: r#"
+                    I'm sorry, I'm not sure I understand. Could you please rephrase your question?
+                    I'm sorry, I'm not sure I understand. Could you please rephrase your question?
+                    I'm sorry, I'm not sure I understand. Could you please rephrase your question?
+                    I'm sorry, I'm not sure I understand. Could you please rephrase your question?"#
+                    .to_string(),
+            },
+            index: 0,
+            finish_reason: "None".to_string(),
+        }],
+        usage: Usage {
+            prompt_tokens: 30,
+            completion_tokens: 30,
+            total_tokens: 60,
+        },
+    };
+
     // Filter internal MessageRole to something supported by the OpenAI API.
-    let conversation_messages: Vec<GPTMessage> = conversation_messages
+    let conversation_messages: Vec<OpenAIMessage> = conversation_messages
         .iter()
         .filter(|x| x.role != MessageRole::Status)
-        .map(|x| {
-            if x.role == MessageRole::Agent {
-                GPTMessage {
-                    role: MessageRole::Assistant,
-                    content: x.content.to_owned(),
-                }
-            } else {
-                x.to_owned()
-            }
-        })
+        .map(|x| x.into())
         .collect();
 
     let request_messages = if conversation_messages
         .first()
-        .is_some_and(|x| x.role == MessageRole::System)
+        .is_some_and(|x| x.role == OpenAIRole::System)
     {
         conversation_messages
     } else {
@@ -76,7 +91,10 @@ pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<Cha
 
     let request_data = GPTRequest {
         model: "gpt-3.5-turbo".to_string(),
-        messages: request_messages,
+        messages: request_messages
+            .iter()
+            .map(|x| x.to_owned().into())
+            .collect(),
         max_tokens: 250,
     };
 
@@ -85,13 +103,28 @@ pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<Cha
         .bearer_auth(&std::env::var("OPENAI_API_KEY").unwrap())
         .json(&request_data)
         .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("Error sending request to OpenAI: {}", e);
-        })
-        .unwrap();
+        .await;
 
-    Json(response.json::<ChatCompletion>().await.unwrap())
+    match response {
+        Ok(response) => {
+            tracing::info!("GPT Request {}", response.status());
+
+            Json(
+                response
+                    .json::<ChatCompletion>()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Error with GPT Request {}", e.to_string());
+                        e.to_string()
+                    })
+                    .unwrap_or(dummy_message),
+            )
+        }
+        Err(err) => {
+            tracing::error!("Error with GPT Request {}", err.to_string());
+            return Json(dummy_message);
+        }
+    }
 }
 
 pub fn generate_jwt(user: &PublicAccountData) -> Result<String, Error> {

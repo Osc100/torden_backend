@@ -1,9 +1,11 @@
-use crate::structs::{Account, AccountResponse, Chat, PublicAccountData, RegisterData};
+use crate::structs::{Account, AccountResponse, Chat, DBMessage, PublicAccountData, RegisterData};
 use crate::utils::{generate_jwt, register_user};
+use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::{response::IntoResponse, Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LoginRequest {
@@ -88,4 +90,27 @@ pub async fn chat_history(Extension(pool): Extension<sqlx::PgPool>) -> impl Into
         .unwrap();
 
     return (StatusCode::OK, Json(json!(chats)));
+}
+
+#[derive(Serialize)]
+struct ChatMessage {
+    role: String,
+    text: String,
+    created: chrono::NaiveDateTime,
+    account_id: Option<i32>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+}
+
+pub async fn chat_messages(
+    Extension(pool): Extension<sqlx::PgPool>,
+    Path(chat_uuid): Path<Uuid>,
+) -> impl IntoResponse {
+    let messages = sqlx::query_as!(
+        ChatMessage,
+        r#"SELECT message.role as "role:_", text, message.created as "created", "account_id", first_name, last_name FROM message INNER JOIN account c ON c.id = message.account_id WHERE chat_id = $1"#,
+        chat_uuid
+    ).fetch_all(&pool).await.unwrap();
+
+    return (StatusCode::OK, Json(json!(messages)));
 }
