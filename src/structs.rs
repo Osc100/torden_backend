@@ -112,9 +112,9 @@ pub struct Chat {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AgentPublicData {
-    id: i32,
-    first_name: String,
-    last_name: String,
+    pub id: i32,
+    pub first_name: String,
+    pub last_name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -237,6 +237,12 @@ pub enum AccountRole {
 #[derive(PartialEq, Hash, Eq)]
 pub struct Company(pub i32);
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DBCompany {
+    pub id: i32,
+    pub name: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub channels: Arc<Mutex<HashMap<Uuid, ChannelState>>>,
@@ -273,7 +279,7 @@ impl ChannelState {
     pub async fn from_db(pool: Pool<Postgres>, uuid: Uuid) -> Self {
         let messages = sqlx::query_as!(
             GPTMessage,
-            r#"SELECT account_id,role as "role: MessageRole", text as content FROM message WHERE chat_id = $1"#,
+            r#"SELECT account_id, role as "role: MessageRole", text as content FROM message WHERE chat_id = $1"#,
             uuid
         )
         .fetch_all(&pool)

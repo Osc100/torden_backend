@@ -1,5 +1,6 @@
 mod api;
 mod chats;
+mod middleware;
 mod structs;
 mod utils;
 use crate::chats::{agent_pool_task, ws_handler};
@@ -24,10 +25,7 @@ async fn main() {
 
     // Initialize tracing subscriber.
     tracing_subscriber::registry()
-        // .with(tracing_subscriber::EnvFilter::new(
-        //     std::env::var("RUST_LOG").unwrap_or_else(|_| "example_chat=trace".into()),
-        // ))
-        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
         .with(tracing_subscriber::fmt::layer().pretty())
         .init();
 
@@ -62,8 +60,10 @@ async fn main() {
         .route("/chat", get(ws_handler))
         .route("/login", post(api::login_handler))
         .route("/register", post(api::register_handler))
+        .route("/companies", get(api::list_companies))
+        .route("/users", get(api::list_users))
         .route("/history", get(api::chat_history))
-        .route("/history/messages", get(api::chat_messages))
+        .route("/history/:chat_uuid", get(api::chat_messages))
         .with_state(app_state)
         .layer(Extension(pool))
         .layer(Extension(agent_tx))
