@@ -480,6 +480,27 @@ pub fn agent_pool_task(
                             .entry(Company(agent.company_id))
                             .or_insert(vec![]);
 
+                        let is_already_in_list = agents.iter().any(|x| x.0.id == agent.id);
+
+                        if is_already_in_list {
+                            let channels = app_state.channels.lock().await;
+                            let assigned_chats = channels.iter().filter(|x| {
+                                x.1.current_agent
+                                    .as_ref()
+                                    .is_some_and(|ca| ca.id == agent.id)
+                            });
+
+                            for (channel, channel_state) in assigned_chats {
+                                agent_sender
+                                    .send(SingleAgentAction::AddChat((
+                                        channel.to_owned(),
+                                        channel_state.to_owned(),
+                                    )))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+
                         agents.push((agent.clone(), agent_sender.clone()));
                     }
 
