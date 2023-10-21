@@ -14,10 +14,10 @@ push:
     git push
 
 pull: push
-    ssh -i {{KEY}} {{SERVER_HOST}} cd ~/Projects/torden_backend && git pull
+    ssh -i {{KEY}} {{SERVER_HOST}} cd /home/ubuntu/repos/torden_backend && git pull
 
 build: pull
-    ssh -i {{KEY}} {{SERVER_HOST}} cd ~/Projects/torden_backend && cargo build --release
+    ssh -i {{KEY}} {{SERVER_HOST}} cd /home/ubuntu/repos/torden_backend && cargo build --release
     
 deploy: build
     ssh -i {{KEY}} {{SERVER_HOST}} "sudo systemctl restart axum"
