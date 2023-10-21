@@ -311,6 +311,8 @@ impl ChannelState {
             None => None,
         };
 
+        tracing::info!("Saving message: {:?}", account_id);
+
         sqlx::query!(
             "INSERT INTO message (chat_id, role, text, account_id) VALUES ($1, $2, $3, $4)",
             ws_message.channel,

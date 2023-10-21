@@ -1,6 +1,7 @@
 use crate::middleware::Auth;
 use crate::structs::{
-    Account, AccountResponse, AccountRole, Chat, PublicAccountData, RegisterData, DBCompany, MessageRole,
+    Account, AccountResponse, AccountRole, Chat, DBCompany, MessageRole, PublicAccountData,
+    RegisterData,
 };
 use crate::utils::{generate_jwt, register_user};
 use axum::extract::Path;
@@ -102,44 +103,63 @@ pub async fn register_handler(
 
     return (
         StatusCode::OK,
-        Json(json!(
-            AccountResponse {
-                account: public_account_data,
-                token
-            }
-        )),
+        Json(json!(AccountResponse {
+            account: public_account_data,
+            token
+        })),
     );
 }
-
-
 
 pub async fn chat_history(
     Auth(user): Auth,
     Extension(pool): Extension<sqlx::PgPool>,
 ) -> impl IntoResponse {
     let chats = match user.role {
-        AccountRole::Superuser => sqlx::query_as!(Chat, "SELECT * FROM chat").fetch_all(&pool).await,
-        AccountRole::Agent => sqlx::query_as!(
-            Chat,
-            r#"SELECT DISTINCT chat.id as "id", chat.created as "created", company_id, ai_description, client_name FROM chat
-            WHERE company_id = $1"#,
-            user.company_id
-        ).fetch_all(&pool).await,
-        AccountRole::Manager => sqlx::query_as!(
-            Chat,
-            r#"SELECT DISTINCT chat.id as "id", chat.created as "created", company_id, ai_description, client_name FROM chat
-            INNER JOIN message m 
-            ON chat.id = m.chat_id
-            WHERE company_id = $1"#,
-            user.company_id
-        ).fetch_all(&pool).await,
-    
+        AccountRole::Superuser => {
+            sqlx::query_as!(
+                Chat,
+                "SELECT DISTINCT chat.* FROM chat JOIN message ON chat.id = message.chat_id
+                ORDER BY chat.created ASC
+                "
+            )
+            .fetch_all(&pool)
+            .await
+        }
+        AccountRole::Agent => {
+            sqlx::query_as!(
+                Chat,
+                r#"SELECT DISTINCT chat.* 
+                FROM chat
+                JOIN message ON chat.id = message.chat_id
+                WHERE company_id = $1
+                ORDER BY chat.created ASC
+                "#,
+                user.company_id
+            )
+            .fetch_all(&pool)
+            .await
+        }
+        AccountRole::Manager => {
+            sqlx::query_as!(
+                Chat,
+                r#"SELECT DISTINCT chat.* FROM chat
+                JOIN message  
+                ON chat.id = message.chat_id
+                WHERE company_id = $1 AND message.account_id = $2
+                ORDER BY chat.created ASC
+                "#,
+                user.company_id,
+                user.id
+            )
+            .fetch_all(&pool)
+            .await
+        }
     };
-    
+
     let chats = chats.unwrap();
-    
+
     // let agents = sqlx::query!(
-    //     r#"SELECT DISTINCT account.id as "id", first_name, last_name, chat_id FROM account 
+    //     r#"SELECT DISTINCT account.id as "id", first_name, last_name, chat_id FROM account
     //     INNER JOIN message m
     //     ON m.account_id = account.id
     //     INNER JOIN chat
@@ -147,20 +167,29 @@ pub async fn chat_history(
     //     WHERE chat.id = any($1)"#,
     //     &chats.iter().map(|x| x.id).collect::<Vec<Uuid>>()
     // ).fetch_all(&pool).await.unwrap();
-    
 
     return (StatusCode::OK, Json(chats));
 }
-
 
 pub async fn list_companies(
     Auth(user): Auth,
     Extension(pool): Extension<sqlx::PgPool>,
 ) -> impl IntoResponse {
-
     let companies = match user.role {
-        AccountRole::Superuser => sqlx::query_as!(DBCompany, "SELECT * FROM company").fetch_all(&pool).await,
-        _ => sqlx::query_as!(DBCompany, "SELECT * FROM company WHERE id = $1", user.company_id).fetch_all(&pool).await,
+        AccountRole::Superuser => {
+            sqlx::query_as!(DBCompany, "SELECT * FROM company")
+                .fetch_all(&pool)
+                .await
+        }
+        _ => {
+            sqlx::query_as!(
+                DBCompany,
+                "SELECT * FROM company WHERE id = $1",
+                user.company_id
+            )
+            .fetch_all(&pool)
+            .await
+        }
     };
 
     let companies = companies.unwrap();
@@ -180,17 +209,26 @@ pub async fn list_users(
     Auth(user): Auth,
     Extension(pool): Extension<sqlx::PgPool>,
 ) -> impl IntoResponse {
-    
-
     let agents = match user.role {
-        AccountRole::Superuser => sqlx::query_as!(DBUser, r#"SELECT id, first_name, last_name, company_id FROM account"#).fetch_all(&pool).await,
-        _ => sqlx::query_as!(DBUser, r#"SELECT id, first_name, last_name, company_id FROM account WHERE company_id = $1"#, user.company_id).fetch_all(&pool).await,
+        AccountRole::Superuser => {
+            sqlx::query_as!(
+                DBUser,
+                r#"SELECT id, first_name, last_name, company_id FROM account"#
+            )
+            .fetch_all(&pool)
+            .await
+        }
+        _ => sqlx::query_as!(
+            DBUser,
+            r#"SELECT id, first_name, last_name, company_id FROM account WHERE company_id = $1"#,
+            user.company_id
+        )
+        .fetch_all(&pool)
+        .await,
     };
-    
 
     let agents = agents.unwrap();
 
-    
     return (StatusCode::OK, Json(agents));
 }
 
@@ -200,6 +238,8 @@ struct DBMessage {
     text: String,
     created: chrono::NaiveDateTime,
     account_id: Option<i32>,
+    first_name: Option<String>,
+    last_name: Option<String>,
 }
 
 pub async fn chat_messages(
@@ -209,13 +249,19 @@ pub async fn chat_messages(
 ) -> impl IntoResponse {
     let messages = sqlx::query_as!(
         DBMessage,
-        r#"SELECT message.role as "role:_", text, message.created as "created", account_id
+        r#"SELECT message.role as "role:_", text, message.created as "created", account_id as "account_id?",
+        first_name as "first_name?", last_name as "last_name?"
            FROM message
-           WHERE chat_id = $1"#,
+           LEFT OUTER JOIN
+           account ON account.id = message.account_id
+           WHERE chat_id = $1
+           "#,
         chat_uuid,
         // user.company_id
-    ).fetch_all(&pool).await.unwrap();
-
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
 
     return (StatusCode::OK, Json(json!(messages)));
 }

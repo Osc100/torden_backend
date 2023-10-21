@@ -57,20 +57,20 @@ async fn main() {
     let agent_task = agent_pool_task(app_state.clone(), agent_rx, agent_tx.clone(), pool.clone());
 
     let app = Router::new()
-        .route("/chat", get(ws_handler))
-        .route("/login", post(api::login_handler))
-        .route("/register", post(api::register_handler))
-        .route("/companies", get(api::list_companies))
-        .route("/users", get(api::list_users))
-        .route("/history", get(api::chat_history))
-        .route("/history/:chat_uuid", get(api::chat_messages))
+        .route("api/chat", get(ws_handler))
+        .route("api/login", post(api::login_handler))
+        .route("api/register", post(api::register_handler))
+        .route("api/companies", get(api::list_companies))
+        .route("api/users", get(api::list_users))
+        .route("api/history", get(api::chat_history))
+        .route("api/history/:chat_uuid", get(api::chat_messages))
         .with_state(app_state)
         .layer(Extension(pool))
         .layer(Extension(agent_tx))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive().allow_methods(Any));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
     tracing::debug!("listening on {}", addr);
 
     axum::Server::bind(&addr)
