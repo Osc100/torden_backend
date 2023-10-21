@@ -70,7 +70,7 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive().allow_methods(Any));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
     tracing::debug!("listening on {}", addr);
 
     axum::Server::bind(&addr)
