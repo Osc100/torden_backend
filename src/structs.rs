@@ -177,7 +177,9 @@ pub struct RegisterData {
     // Only to be used in restricted registrations, because of the modifiable role.
     #[validate(email)]
     pub email: String,
+    #[validate(length(min = 8))]
     pub password: String,
+    pub confirm_password: String,
     pub first_name: String,
     pub last_name: String,
     pub role: AccountRole,
