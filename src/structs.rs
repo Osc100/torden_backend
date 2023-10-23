@@ -103,7 +103,7 @@ impl Into<OpenAIMessage> for &GPTMessage {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Chat {
     pub id: Uuid,
-    pub created: chrono::NaiveDateTime,
+    pub created: chrono::NaiveDateTim,
     pub company_id: i32,
     // pub agents: Option<Vec<GPTMessage>>,
     pub ai_description: Option<String>,
