@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, Mutex};
+use validator::Validate;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -103,7 +104,7 @@ impl Into<OpenAIMessage> for &GPTMessage {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Chat {
     pub id: Uuid,
-    pub created: chrono::NaiveDateTim,
+    pub created: chrono::NaiveDateTime,
     pub company_id: i32,
     // pub agents: Option<Vec<GPTMessage>>,
     pub ai_description: Option<String>,
@@ -171,9 +172,10 @@ pub struct Account {
     pub created: chrono::NaiveDateTime,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Validate, Deserialize)]
 pub struct RegisterData {
     // Only to be used in restricted registrations, because of the modifiable role.
+    #[validate(email)]
     pub email: String,
     pub password: String,
     pub first_name: String,

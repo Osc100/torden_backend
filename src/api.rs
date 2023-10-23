@@ -52,7 +52,7 @@ pub async fn login_handler(
         StatusCode::OK,
         Json(json!(AccountResponse {
             account: public_account_data,
-            token: token,
+            token,
         })),
     );
 }
