@@ -73,14 +73,14 @@ pub enum MessageRole {
     Agent,
 }
 
-impl Into<OpenAIRole> for MessageRole {
-    fn into(self) -> OpenAIRole {
-        match self {
+impl From<MessageRole> for OpenAIRole {
+    fn from(original: MessageRole) -> Self {
+        match original {
+            MessageRole::User => OpenAIRole::User,
             MessageRole::Agent => OpenAIRole::Assistant,
-            MessageRole::Status => OpenAIRole::System,
             MessageRole::Assistant => OpenAIRole::Assistant,
             MessageRole::System => OpenAIRole::System,
-            MessageRole::User => OpenAIRole::User,
+            MessageRole::Status => OpenAIRole::System,
         }
     }
 }
@@ -92,11 +92,11 @@ pub struct GPTMessage {
     pub content: String,
 }
 
-impl Into<OpenAIMessage> for &GPTMessage {
-    fn into(self) -> OpenAIMessage {
+impl From<&GPTMessage> for OpenAIMessage {
+    fn from(val: &GPTMessage) -> Self {
         OpenAIMessage {
-            role: self.role.into(),
-            content: self.content.clone(),
+            role: val.role.into(),
+            content: val.content.clone(),
         }
     }
 }

@@ -48,13 +48,13 @@ pub async fn login_handler(
     let public_account_data = PublicAccountData::from(&user);
     let token = generate_jwt(&public_account_data).unwrap();
 
-    return (
+    (
         StatusCode::OK,
         Json(json!(AccountResponse {
             account: public_account_data,
             token,
         })),
-    );
+    )
 }
 
 pub async fn register_handler(
@@ -84,7 +84,7 @@ pub async fn register_handler(
         AccountRole::Agent => {
             return cheeky_response;
         }
-    }
+    };
 
     let db_user = match registration_result {
         Ok(user) => user,
@@ -98,16 +98,16 @@ pub async fn register_handler(
         }
     };
 
-    let public_account_data = PublicAccountData::from(&db_user.into());
+    let public_account_data = PublicAccountData::from(&db_user);
     let token = generate_jwt(&public_account_data).unwrap();
 
-    return (
+    (
         StatusCode::OK,
         Json(json!(AccountResponse {
             account: public_account_data,
             token
         })),
-    );
+    )
 }
 
 pub async fn chat_history(
@@ -168,7 +168,7 @@ pub async fn chat_history(
     //     &chats.iter().map(|x| x.id).collect::<Vec<Uuid>>()
     // ).fetch_all(&pool).await.unwrap();
 
-    return (StatusCode::OK, Json(chats));
+    (StatusCode::OK, Json(chats))
 }
 
 pub async fn list_companies(
@@ -194,7 +194,7 @@ pub async fn list_companies(
 
     let companies = companies.unwrap();
 
-    return (StatusCode::OK, Json(companies));
+    (StatusCode::OK, Json(companies))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -229,7 +229,7 @@ pub async fn list_users(
 
     let agents = agents.unwrap();
 
-    return (StatusCode::OK, Json(agents));
+    (StatusCode::OK, Json(agents))
 }
 
 #[derive(Serialize)]
@@ -263,7 +263,7 @@ pub async fn chat_messages(
     .await
     .unwrap();
 
-    return (StatusCode::OK, Json(json!(messages)));
+    (StatusCode::OK, Json(json!(messages)))
 }
 
 // From a reqstruct ExtractUserAgent(HeaderValue);

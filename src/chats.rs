@@ -43,7 +43,7 @@ pub async fn handle_socket(
     state: Arc<AppState>,
     pool: Pool<Postgres>,
     agent_tx: mpsc::Sender<AgentPoolAction>,
-) -> () {
+) {
     let (mut sender, mut receiver) = stream.split();
     let mut transmitters: Vec<(Uuid, ChannelTransmitter)> = vec![];
     let mut agent_receiver: Option<mpsc::Receiver<SingleAgentAction>> = None;
@@ -178,7 +178,7 @@ pub async fn handle_socket(
         let agent_extra_tasks = agent_extra_tasks.clone();
         let pool = pool.clone();
 
-        let new_task = tokio::spawn(async move {
+        let new_task: JoinHandle<()> = tokio::spawn(async move {
             while let Some(action) = agent_receiver.recv().await {
                 match action {
                     SingleAgentAction::AddChat((channel, channel_state)) => {
@@ -187,26 +187,20 @@ pub async fn handle_socket(
                         let _ = sender_arc
                             .lock()
                             .await
-                            .send(
-                                Message::Text(
-                                    serde_json::to_string(
-                                        &channel_state
-                                            .message_vec_to_ws_messages(&pool, channel)
-                                            .await
-                                            .unwrap(),
-                                    )
-                                    .unwrap(),
+                            .send(Message::Text(
+                                serde_json::to_string(
+                                    &channel_state
+                                        .message_vec_to_ws_messages(&pool, channel)
+                                        .await
+                                        .unwrap(),
                                 )
-                                .into(),
-                            )
+                                .unwrap(),
+                            ))
                             .await;
 
                         // Start task.
-                        let task = start_channel_listener(
-                            channel.clone(),
-                            channel_state.transmitter,
-                            sender_arc,
-                        );
+                        let task =
+                            start_channel_listener(channel, channel_state.transmitter, sender_arc);
                         agent_extra_tasks.lock().await.push((channel, task));
                     }
                     SingleAgentAction::RemoveChat((channel_to_remove, transmitter)) => {
@@ -223,12 +217,9 @@ pub async fn handle_socket(
                             .unwrap();
 
                         for (channel, task) in agent_extra_tasks.lock().await.iter_mut() {
-                            if channel_to_remove == channel.to_owned() {
+                            if &channel_to_remove == channel {
                                 task.abort();
-                                agent_extra_tasks
-                                    .lock()
-                                    .await
-                                    .retain(|x| x.0 != channel.to_owned());
+                                agent_extra_tasks.lock().await.retain(|x| &x.0 != channel);
                                 break;
                             }
                         }
@@ -393,7 +384,7 @@ pub async fn handle_first_message(
                             .lock()
                             .await
                             .iter()
-                            .map(|c| (c.0.clone(), c.1.transmitter.clone()))
+                            .map(|c| (*c.0, c.1.transmitter.clone()))
                             .collect(),
                         agent_receiver,
                     });
@@ -407,7 +398,7 @@ pub async fn handle_first_message(
         }
     }
 
-    return FirstMessageResult::Break;
+    FirstMessageResult::Break
 }
 
 fn start_channel_listener(
@@ -656,11 +647,11 @@ async fn unassigned_chats_asign_agent(
                     },
                     agent_data: None,
                 },
-                &pool,
+                pool,
             )
             .await
             .unwrap();
     }
 
-    return inmutable_channels_vec;
+    inmutable_channels_vec
 }
