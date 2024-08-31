@@ -33,7 +33,7 @@ pub async fn register_user(
     ).fetch_one(pool).await.map_err(|e| e.to_string())?;
     // uniqueness is enforced at the database level.
 
-    return Ok(db_user);
+    Ok(db_user)
 }
 
 pub async fn query_to_openai(conversation_messages: Vec<GPTMessage>) -> Json<ChatCompletion> {
@@ -120,7 +120,7 @@ Distribucion para llegar a los clientes o canales de distribucion: Nos mercadeam
     };
 
     let request_data = GPTRequest {
-        model: "gpt-3.5-turbo".to_string(),
+        model: "gpt-4o-mini".to_string(),
         messages: request_messages
             .iter()
             .map(|x| x.to_owned().into())

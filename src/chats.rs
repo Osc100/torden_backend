@@ -439,8 +439,8 @@ pub async fn load_channel_messages(
     let mut channels = state.channels.lock().await;
 
     let channel_state = channels
-        .entry(channel.clone())
-        .or_insert(ChannelState::from_db(pool.clone(), channel.clone()).await);
+        .entry(channel)
+        .or_insert(ChannelState::from_db(pool.clone(), channel).await);
 
     let transmitter = Some(channel_state.transmitter.clone()).unwrap();
     let messages = channel_state.messages.clone();
@@ -450,7 +450,7 @@ pub async fn load_channel_messages(
         .await
         .unwrap();
 
-    return transmitter;
+    transmitter
 }
 
 pub fn agent_pool_task(

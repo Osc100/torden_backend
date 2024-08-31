@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:alpine # Definimos la imagen que usaremos para correr la BD,
+    #                       en este caso la imagen oficial de postgres corriento en Alpine Linux.
+    environment:
+      POSTGRES_USER: postgres # Usuario de la db
+      POSTGRES_DB: torden # Nombre de la db
+      POSTGRES_PASSWORD: postgres # Contraseña de la db
+
+    volumes:
+      - pgdata:/var/lib/posgresql/data # Montamos el volumen pgdata en el directorio donde postgres guarda los datos.
+    ports:
+      - 5432:5432 # Montamos el puerto 5432 dentro del contenedor al sistema que lo corre
+
+volumes:
+  pgdata: # Declaramos el volumen pgdata para que persistan los datos de la db
